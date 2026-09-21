@@ -1,0 +1,18 @@
+{
+  "name": "avtoservis",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Auto service management website — React + Express + SQLite",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c yellow,cyan \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "build": "npm run build -w client",
+    "start": "npm run start -w server",
+    "install:all": "npm run setup -w server && npm install"
+  }
+}
