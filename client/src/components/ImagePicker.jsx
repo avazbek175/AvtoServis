@@ -3,7 +3,7 @@ import { api } from '../api';
 import Icon from './icons';
 import { Modal, Spinner, Alert } from './ui';
 
-export default function ImagePicker({ value, onChange, label = 'Rasm', hint = 'JPG, PNG, WEBP. Maks 6MB' }) {
+export default function ImagePicker({ value, onChange, label = 'Rasm', hint = 'JPG, PNG, WEBP, AVIF. Maks 6MB', prefix = 'gallery' }) {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState('upload');
   const [media, setMedia] = useState([]);
@@ -36,6 +36,7 @@ export default function ImagePicker({ value, onChange, label = 'Rasm', hint = 'J
     try {
       const fd = new FormData();
       fd.append('file', file);
+      fd.append('prefix', prefix);
       const res = await api.post('/admin/uploads', fd);
       onChange(res.url);
       setOpen(false);
@@ -115,10 +116,10 @@ export default function ImagePicker({ value, onChange, label = 'Rasm', hint = 'J
               <button
                 key={m.id}
                 type="button"
-                onClick={() => { onChange(`/api/media/${m.filename}`); setOpen(false); }}
-                className={`group relative aspect-square overflow-hidden rounded-xl border transition ${value === `/api/media/${m.filename}` ? 'border-[rgb(var(--c-primary))] ring-2 ring-[rgb(var(--c-primary))]/40' : 'border-white/10 hover:border-white/30'}`}
+                onClick={() => { onChange(m.url); setOpen(false); }}
+                className={`group relative aspect-square overflow-hidden rounded-xl border transition ${value === m.url ? 'border-[rgb(var(--c-primary))] ring-2 ring-[rgb(var(--c-primary))]/40' : 'border-white/10 hover:border-white/30'}`}
               >
-                <img src={`/api/media/${m.filename}`} alt={m.original_name} className="h-full w-full object-cover transition duration-200 group-hover:scale-105" />
+                <img src={m.url} alt={m.original_name} className="h-full w-full object-cover transition duration-200 group-hover:scale-105" />
               </button>
             ))}
           </div>

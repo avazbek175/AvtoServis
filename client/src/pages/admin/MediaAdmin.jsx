@@ -60,8 +60,8 @@ export default function MediaAdmin() {
   }
 
   function copyUrl(m) {
-    navigator.clipboard?.writeText(window.location.origin + '/api/media/' + m.filename).then(
-      () => { setError(''); setMsg(m.filename); setTimeout(() => setMsg(''), 1600); },
+    navigator.clipboard?.writeText(m.url).then(
+      () => { setError(''); setMsg(m.url); setTimeout(() => setMsg(''), 1600); },
       () => {}
     );
   }
@@ -81,7 +81,7 @@ export default function MediaAdmin() {
       </div>
 
       {error && <Alert>{error}</Alert>}
-      {msg && <Alert kind="success">Havola nusxalandi: /api/media/{msg}</Alert>}
+      {msg && <Alert kind="success">Havola nusxalandi</Alert>}
 
       {!media ? (
         <Loading />
@@ -92,7 +92,7 @@ export default function MediaAdmin() {
           {media.map((m) => (
             <div key={m.id} className="card group overflow-hidden !p-0">
               <div className="relative aspect-square overflow-hidden">
-                <img src={`/api/media/${m.filename}`} alt={m.original_name} className="h-full w-full object-cover transition duration-300 group-hover:scale-105" />
+                <img src={m.url} alt={m.original_name} className="h-full w-full object-cover transition duration-300 group-hover:scale-105" />
                 <div className="absolute right-2 top-2">
                   <Badge kind="default">{formatSize(m.size)}</Badge>
                 </div>

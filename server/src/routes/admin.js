@@ -4,6 +4,7 @@ const path = require('path');
 const multer = require('multer');
 const { db } = require('../db');
 const auth = require('../auth');
+const storage = require('../storage');
 const { getSetting, setSetting, getAllSettings } = require('../settings');
 
 const router = express.Router();
@@ -18,7 +19,7 @@ function uniqueFilename(original) {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${base}${ext}`;
 }
 
-const storage = multer.diskStorage({
+const disk = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = path.join(__dirname, '..', '..', 'uploads');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -28,44 +29,100 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({
-  storage,
+  storage: disk,
   limits: { fileSize: MAX_IMAGE_SIZE, files: 1 },
   fileFilter: (req, file, cb) => {
-    const allowed = /^image\/(png|jpe?g|webp|gif|svg\+xml|avif)$/;
-    if (!allowed.test(file.mimetype)) return cb(new Error('Faqat rasm fayllari ruxsat etiladi'));
+    if (!storage.isValidMime(file.mimetype)) {
+      return cb(new Error('Faqat JPG, PNG, WEBP, AVIF rasmlari ruxsat etiladi'));
+    }
     cb(null, true);
   },
 });
 
-router.post('/uploads', auth.authorizePermission('media'), upload.single('file'), (req, res) => {
+function mediaUrl(item) {
+  return item.object_key ? storage.publicUrl(item.object_key) : `/api/media/${item.filename}`;
+}
+
+function referencedUrlStrings() {
+  const refs = new Set();
+  for (const section of Object.values(getAllSettings())) {
+    for (const v of Object.values(section)) {
+      if (typeof v === 'string' && v) refs.add(v);
+    }
+  }
+  for (const s of db.prepare('SELECT image FROM services').all()) {
+    if (s.image) refs.add(s.image);
+  }
+  return refs;
+}
+
+async function safeDeleteR2Url(url) {
+  if (!storage.isR2Url(url)) return;
+  const key = storage.keyFromUrl(url);
+  if (!key) return;
+  const refs = referencedUrlStrings();
+  if (refs.has(String(url))) return;
+  const inMedia = db.prepare('SELECT COUNT(*) c FROM media WHERE object_key = ?').get(key).c;
+  const inWork = db.prepare('SELECT COUNT(*) c FROM work_log_images WHERE object_key = ?').get(key).c;
+  if (inMedia + inWork > 0) return;
+  await storage.remove(key).catch(() => {});
+}
+
+router.post('/uploads', auth.authorizePermission('media'), upload.single('file'), async (req, res, next) => {
   if (!req.file) return res.status(400).json({ error: 'Fayl yuklanmadi' });
-  const info = db
-    .prepare('INSERT INTO media (filename, original_name, mime, size) VALUES (?, ?, ?, ?)')
-    .run(req.file.filename, req.file.originalname, req.file.mimetype, req.file.size);
-  const filename = req.file.filename;
-  res.status(201).json({ media: { id: info.lastInsertRowid, filename, original_name: req.file.originalname, mime: req.file.mimetype, size: req.file.size }, url: `/api/media/${filename}` });
+  try {
+    const prefix = storage.normalizePrefix((req.body && req.body.prefix) || 'gallery');
+    let url = `/api/media/${req.file.filename}`;
+    let objectKey = '';
+
+    if (storage.enabled) {
+      objectKey = storage.makeKey(prefix, req.file.mimetype);
+      await storage.upload({
+        key: objectKey,
+        mime: req.file.mimetype,
+        body: fs.createReadStream(req.file.path),
+      });
+      await fs.promises.unlink(req.file.path).catch(() => {});
+      url = storage.publicUrl(objectKey);
+    }
+
+    const info = db
+      .prepare('INSERT INTO media (filename, original_name, mime, size, object_key) VALUES (?, ?, ?, ?, ?)')
+      .run(req.file.filename, req.file.originalname, req.file.mimetype, req.file.size, objectKey);
+    const row = db.prepare('SELECT id, filename, original_name, mime, size, object_key FROM media WHERE id = ?').get(info.lastInsertRowid);
+    res.status(201).json({ media: { ...row, url }, url });
+  } catch (err) {
+    if (req.file && req.file.path) await fs.promises.unlink(req.file.path).catch(() => {});
+    next(err);
+  }
 });
 
 router.get('/media', auth.authorizePermission('media'), (req, res) => {
-  const items = db.prepare('SELECT id, filename, original_name, mime, size, created_at FROM media ORDER BY id DESC').all();
-  res.json({ media: items });
+  const items = db.prepare('SELECT id, filename, original_name, mime, size, object_key, created_at FROM media ORDER BY id DESC').all();
+  res.json({ media: items.map((m) => ({ ...m, url: mediaUrl(m) })) });
 });
 
-router.delete('/media/:id', auth.authorizePermission('media'), (req, res) => {
-  const item = db.prepare('SELECT filename FROM media WHERE id = ?').get(Number(req.params.id));
+router.delete('/media/:id', auth.authorizePermission('media'), async (req, res, next) => {
+  const item = db.prepare('SELECT * FROM media WHERE id = ?').get(Number(req.params.id));
   if (!item) return res.status(404).json({ error: 'Media topilmadi' });
 
-  const inSettings = Object.values(getAllSettings()).some(
-    (sect) => Object.values(sect).some((v) => typeof v === 'string' && v.includes(`/api/media/${item.filename}`))
-  );
-  const inServices = db.prepare('SELECT COUNT(*) c FROM services WHERE image = ?').get(`/api/media/${item.filename}`).c;
-  if (inSettings || inServices > 0) {
+  const refs = referencedUrlStrings();
+  if (refs.has(`/api/media/${item.filename}`) || (item.object_key && refs.has(storage.publicUrl(item.object_key)))) {
     return res.status(409).json({ error: 'Bu rasm saytda ishlatilmoqda. Avval boshqa rasmni tanlang' });
   }
 
   db.prepare('DELETE FROM media WHERE id = ?').run(Number(req.params.id));
-  const filePath = path.join(__dirname, '..', '..', 'uploads', item.filename);
-  fs.promises.unlink(filePath).catch(() => {});
+  try {
+    if (item.object_key) {
+      await storage.remove(item.object_key);
+    } else {
+      const filePath = path.join(__dirname, '..', '..', 'uploads', item.filename);
+      await fs.promises.unlink(filePath).catch(() => {});
+    }
+  } catch (err) {
+    next(err);
+    return;
+  }
   res.json({ ok: true });
 });
 
@@ -89,7 +146,7 @@ router.post('/services', auth.authorizePermission('services'), (req, res) => {
   res.status(201).json({ service });
 });
 
-router.put('/services/:id', auth.authorizePermission('services'), (req, res) => {
+router.put('/services/:id', auth.authorizePermission('services'), async (req, res, next) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM services WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Xizmat topilmadi' });
@@ -116,6 +173,16 @@ router.put('/services/:id', auth.authorizePermission('services'), (req, res) => 
       id
     );
   const service = db.prepare('SELECT * FROM services WHERE id = ?').get(id);
+
+  if (existing.image && b.image !== undefined && String(b.image) !== String(existing.image)) {
+    try {
+      await safeDeleteR2Url(existing.image);
+    } catch (err) {
+      next(err);
+      return;
+    }
+  }
+
   res.json({ service });
 });
 
@@ -134,11 +201,19 @@ router.patch('/services/reorder', auth.authorizePermission('services'), (req, re
   res.json({ ok: true });
 });
 
-router.delete('/services/:id', auth.authorizePermission('services'), (req, res) => {
+router.delete('/services/:id', auth.authorizePermission('services'), async (req, res, next) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM services WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Xizmat topilmadi' });
   db.prepare('DELETE FROM services WHERE id = ?').run(id);
+  if (existing.image) {
+    try {
+      await safeDeleteR2Url(existing.image);
+    } catch (err) {
+      next(err);
+      return;
+    }
+  }
   res.json({ ok: true });
 });
 
@@ -153,17 +228,34 @@ router.get('/settings/:key', auth.authorizePermission('content'), (req, res) => 
   res.json({ settings: getSetting(key) });
 });
 
-router.put('/settings/:key', auth.authorizePermission('content'), (req, res) => {
+router.put('/settings/:key', auth.authorizePermission('content'), async (req, res, next) => {
   const key = req.params.key;
   if (key === 'worklog' && req.user.role !== 'super_admin') {
     return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
   }
   const value = req.body && req.body.value !== undefined ? req.body.value : req.body;
   try {
+    const prev = getSetting(key);
     const saved = setSetting(key, value);
+
+    const collectStrings = (obj, acc) => {
+      if (!obj || typeof obj !== 'object') return acc;
+      for (const v of Object.values(obj)) {
+        if (typeof v === 'string') acc.push(v);
+        else if (v && typeof v === 'object') collectStrings(v, acc);
+      }
+      return acc;
+    };
+    const dropped = collectStrings(prev, []).filter(
+      (u) => storage.isR2Url(u) && !collectStrings(saved, []).includes(u)
+    );
+    for (const url of new Set(dropped)) {
+      await safeDeleteR2Url(url);
+    }
     res.json({ settings: saved });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    if (err.status && err.status === 400) return res.status(400).json({ error: err.message });
+    next(err);
   }
 });
 

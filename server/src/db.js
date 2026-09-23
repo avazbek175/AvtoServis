@@ -63,6 +63,7 @@ db.exec(`
     original_name TEXT NOT NULL DEFAULT '',
     mime TEXT NOT NULL DEFAULT '',
     size INTEGER NOT NULL DEFAULT 0,
+    object_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -101,6 +102,7 @@ db.exec(`
     work_log_id INTEGER NOT NULL,
     image_path TEXT NOT NULL,
     original_filename TEXT NOT NULL DEFAULT '',
+    object_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (work_log_id) REFERENCES work_logs(id) ON DELETE CASCADE
   );
@@ -118,6 +120,20 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_pending_email
     ON master_applications(email) WHERE status IN ('pending', 'approved');
 `);
+
+db.createTableIfNotExists = function (table, ddl) {
+  return db.exec(`CREATE TABLE IF NOT EXISTS ${table} (${ddl})`);
+};
+
+function ensureColumn(tableName, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${ddl}`);
+  }
+}
+
+ensureColumn('media', 'object_key', "object_key TEXT NOT NULL DEFAULT ''");
+ensureColumn('work_log_images', 'object_key', "object_key TEXT NOT NULL DEFAULT ''");
 
 const DEFAULT_MASTER_PERMISSIONS = ['content', 'services', 'media'];
 

@@ -4,6 +4,7 @@ const path = require('path');
 const multer = require('multer');
 const { db } = require('../db');
 const auth = require('../auth');
+const storage = require('../storage');
 
 const router = express.Router();
 router.use(auth.authenticate);
@@ -71,8 +72,8 @@ const workUpload = multer({
   }),
   limits: { fileSize: MAX_IMAGE_SIZE, files: 10 },
   fileFilter: (req, file, cb) => {
-    if (!/^image\/(jpe?g|png|webp)$/.test(file.mimetype)) {
-      return cb(new Error('Faqat JPG, JPEG, PNG, WEBP ruxsat etiladi'));
+    if (!storage.isValidMime(file.mimetype)) {
+      return cb(new Error('Faqat JPG, JPEG, PNG, WEBP, AVIF ruxsat etiladi'));
     }
     cb(null, true);
   },
@@ -220,13 +221,24 @@ router.put('/:id', (req, res) => {
   res.json({ work: decorate(loadWork(work.id)) });
 });
 
-router.delete('/:id', (req, res) => {
+router.delete('/:id', async (req, res, next) => {
   const work = loadWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Ish topilmadi' });
   if (!canAccess(req, work)) return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
-  const images = db.prepare('SELECT image_path FROM work_log_images WHERE work_log_id = ?').all(work.id);
-  for (const img of images) fs.promises.unlink(path.join(WORK_DIR, img.image_path)).catch(() => {});
+  const images = db.prepare('SELECT image_path, object_key FROM work_log_images WHERE work_log_id = ?').all(work.id);
   db.prepare('DELETE FROM work_logs WHERE id = ?').run(work.id);
+  try {
+    for (const img of images) {
+      if (img.object_key) {
+        await storage.remove(img.object_key);
+      } else {
+        await fs.promises.unlink(path.join(WORK_DIR, img.image_path)).catch(() => {});
+      }
+    }
+  } catch (err) {
+    next(err);
+    return;
+  }
   res.json({ ok: true });
 });
 
@@ -239,7 +251,7 @@ function ownedWork(req, res, next) {
 }
 
 router.post('/:id/images', ownedWork, (req, res) => {
-  workUpload.array('files', 10)(req, res, (err) => {
+  workUpload.array('files', 10)(req, res, async (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'Rasm juda katta (maks 5MB)' });
       if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: 'Bitta so\'rovda ko\'pi bilan 10 ta rasm yuboriladi' });
@@ -253,13 +265,26 @@ router.post('/:id/images', ownedWork, (req, res) => {
       files.forEach((f) => fs.promises.unlink(path.join(WORK_DIR, f.filename)).catch(() => {}));
       return res.status(400).json({ error: `Bitta ishga ko'pi bilan ${MAX_WORK_IMAGES} ta rasm qo'shish mumkin` });
     }
-    const ins = db.prepare('INSERT INTO work_log_images (work_log_id, image_path, original_filename) VALUES (?, ?, ?)');
-    for (const f of files) ins.run(req.work.id, f.filename, f.originalname);
-    res.status(201).json({ images: imagesFor(req.work.id) });
+    try {
+      const ins = db.prepare('INSERT INTO work_log_images (work_log_id, image_path, original_filename, object_key) VALUES (?, ?, ?, ?)');
+      for (const f of files) {
+        let objectKey = '';
+        if (storage.enabled) {
+          objectKey = storage.makeKey('gallery', f.mimetype);
+          await storage.upload({ key: objectKey, mime: f.mimetype, body: fs.createReadStream(f.path) });
+          await fs.promises.unlink(f.path).catch(() => {});
+        }
+        ins.run(req.work.id, f.filename, f.originalname, objectKey);
+      }
+      res.status(201).json({ images: imagesFor(req.work.id) });
+    } catch (e) {
+      files.forEach((f) => fs.promises.unlink(path.join(WORK_DIR, f.filename)).catch(() => {}));
+      res.status(500).json({ error: 'Rasm yuklashda xatolik' });
+    }
   });
 });
 
-router.delete('/images/:imageId', (req, res) => {
+router.delete('/images/:imageId', async (req, res, next) => {
   const imageId = Number(req.params.imageId);
   if (!Number.isInteger(imageId)) return res.status(400).json({ error: 'Noto\'g\'ri rasm ID' });
   const img = db.prepare('SELECT * FROM work_log_images WHERE id = ?').get(imageId);
@@ -268,7 +293,16 @@ router.delete('/images/:imageId', (req, res) => {
   if (!work) return res.status(404).json({ error: 'Ish topilmadi' });
   if (!canAccess(req, work)) return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
   db.prepare('DELETE FROM work_log_images WHERE id = ?').run(img.id);
-  fs.promises.unlink(path.join(WORK_DIR, img.image_path)).catch(() => {});
+  try {
+    if (img.object_key) {
+      await storage.remove(img.object_key);
+    } else {
+      await fs.promises.unlink(path.join(WORK_DIR, img.image_path)).catch(() => {});
+    }
+  } catch (err) {
+    next(err);
+    return;
+  }
   res.json({ ok: true, images: imagesFor(work.id) });
 });
 
