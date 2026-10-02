@@ -29,6 +29,12 @@ const PG_DB = 'avtoservis_test';
 // A second database in the same cluster, used to reproduce the production
 // situation where `settings` already exists with the legacy wide-row shape.
 const PG_LEGACY_DB = 'avtoservis_legacy_test';
+// Deliberately absent when the instance boots: reproduces a cold start that loses
+// the race against a provider failover or a pooler warmup.
+const PG_LATE_DB = 'avtoservis_late_test';
+// Its own legacy database for the HTTP-level check: PG_LEGACY_DB is left in a
+// deliberately rebuilt state at the end of the group above.
+const PG_LEGACY_HTTP_DB = 'avtoservis_legacy_http_test';
 const PG_USER = 'avtoservis';
 const PG_PASSWORD = 'avtoservis_test_pw';
 const PORT = Number(process.env.TEST_PORT || 4321);
@@ -152,6 +158,7 @@ function restore(target, backup) {
 }
 
 const backups = [];
+const extraChildren = [];
 let child = null;
 let pg = null;
 
@@ -978,6 +985,9 @@ async function securityTests(ctx) {
 
   // ================================================== P12. legacy settings
   await legacySettingsTests();
+
+  // ================================================ P13. startup readiness
+  await readinessTests();
 }
 
 /** Runs the real migration CLI against the legacy database. */
@@ -1013,9 +1023,9 @@ function checkSchemaIn(db) {
   });
 }
 
-function legacyClient() {
+function legacyClient(db = PG_LEGACY_DB) {
   return new pgDriver.Client({
-    host: '127.0.0.1', port: PG_PORT, user: PG_USER, password: PG_PASSWORD, database: PG_LEGACY_DB,
+    host: '127.0.0.1', port: PG_PORT, user: PG_USER, password: PG_PASSWORD, database: db,
   });
 }
 
@@ -1170,12 +1180,173 @@ async function legacySettingsTests() {
   await db.end();
 }
 
+/**
+ * A startup failure used to be remembered for the life of the process.
+ *
+ * `ready` was one module-level promise, so a single failed cold start answered 503
+ * to every request on that instance forever, even after the database became
+ * healthy. With several serverless instances behind one hostname that shows up as
+ * some endpoints answering 200 and others 503, and `checkSchema` passing.
+ *
+ * These tests pin the two halves of the fix: the process must survive the failure
+ * (the rejection was unhandled until the first request, which killed the function),
+ * and it must recover by itself once the database is reachable.
+ */
+async function readinessTests() {
+  group('P13. Startup readiness recovers after a failed cold start');
+
+  const port = PORT + 1;
+  const base = `http://127.0.0.1:${port}`;
+  const dbUrl = (db) => `postgresql://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${db}`;
+  const logs = [];
+  const extra = spawn(process.execPath, [ENTRY], {
+    env: serverEnv({ PORT: String(port), DATABASE_URL: dbUrl(PG_LATE_DB) }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  extraChildren.push(extra);
+  extra.stdout.on('data', (d) => logs.push(d.toString()));
+  extra.stderr.on('data', (d) => logs.push(d.toString()));
+  let exitCode = null;
+  extra.on('exit', (code) => { exitCode = code; });
+
+  // `status: 0` means the socket is not up yet, which is distinct from a 503.
+  const get = async (p, origin = base) => {
+    try {
+      const res = await fetch(origin + p, { signal: AbortSignal.timeout(10000) });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* non-JSON body */ }
+      return { status: res.status, data, text };
+    } catch (e) {
+      return { status: 0, data: null, text: e.message };
+    }
+  };
+
+  // The database does not exist yet, so the boot attempt fails with 3D000.
+  let early = { status: 0, text: 'never connected' };
+  for (let i = 0; i < 100 && early.status === 0; i++) {
+    early = await get('/api/public/services');
+    if (early.status === 0) await new Promise((r) => setTimeout(r, 100));
+  }
+  check(early.status === 503 && early.data?.error === 'Database is not ready',
+    'P13.1 a failing cold start answers 503 instead of crashing', `status=${early.status} ${early.text.slice(0, 80)} exit=${exitCode}`);
+  check(exitCode === null, 'P13.2 the process is still alive after the startup failure', `exit=${exitCode}`);
+
+  const logText = () => logs.join('');
+  check(/startup failed during (migrate|seed)/.test(logText()),
+    'P13.3 the log names the failing startup stage', logText().split('\n').find((l) => l.includes('startup failed')) || '(no startup failure logged)');
+  check(/3D000/.test(logText()) && /does not exist/.test(logText()),
+    'P13.4 the log carries the real PostgreSQL error code and message',
+    logText().split('\n').find((l) => l.includes('3D000')) || '(no 3D000 logged)');
+  check(!logText().includes(PG_PASSWORD),
+    'P13.5 the log does not leak the database password');
+
+  // The database becomes healthy underneath the already-failing instance.
+  await pg.createDatabase(PG_LATE_DB);
+  const mig = spawn(process.execPath, ['scripts/migrate.js'], {
+    env: serverEnv({ DATABASE_URL: dbUrl(PG_LATE_DB) }),
+    cwd: SERVER_ROOT,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const migCode = await new Promise((res) => mig.on('exit', res));
+  check(migCode === 0, 'P13.6 the late database is migrated', `exit=${migCode}`);
+
+  // No restart: the same instance has to notice on its own.
+  let recovered = null;
+  for (let i = 0; i < 60 && !recovered; i++) {
+    const res = await get('/api/public/services');
+    if (res.status === 200) recovered = res;
+    else await new Promise((r) => setTimeout(r, 500));
+  }
+  check(!!recovered, 'P13.7 the failed instance recovers without a restart', `last=${recovered ? recovered.status : 'never 200'}`);
+
+  const endpoints = ['/api/public/services', '/api/public/settings', '/api/public/worklogs'];
+  for (const [i, p] of endpoints.entries()) {
+    const res = await get(p);
+    check(res.status === 200, `P13.${8 + i} ${p} serves 200 after recovery`, `status=${res.status} ${res.text.slice(0, 80)}`);
+  }
+  const settings = await get('/api/public/settings');
+  check(settings.data?.settings?.site && typeof settings.data.settings.site === 'object'
+    && typeof settings.data.settings.worklog === 'object',
+    'P13.11 every default settings document is parsed as an object',
+    JSON.stringify(Object.keys(settings.data?.settings || {})));
+
+  const me = await get('/api/auth/me');
+  check(me.status === 401, 'P13.12 /api/auth/me reaches the session check after recovery (401, not 503)', `status=${me.status}`);
+
+  check(exitCode === null, 'P13.13 the instance never crashed during the whole sequence', `exit=${exitCode}`);
+
+  group('P14. Legacy settings served over HTTP');
+  const legacyUrl = dbUrl(PG_LEGACY_HTTP_DB);
+  // Build a legacy database from scratch, so this group does not depend on the
+  // state another group leaves behind.
+  await pg.createDatabase(PG_LEGACY_HTTP_DB);
+  const legacyDb = legacyClient(PG_LEGACY_HTTP_DB);
+  await legacyDb.connect();
+  await legacyDb.query(`CREATE TABLE settings (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    description TEXT,
+    phone TEXT,
+    telegram TEXT,
+    address TEXT,
+    logo TEXT,
+    favicon TEXT,
+    social TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  await legacyDb.query(
+    `INSERT INTO settings (name, description, phone, telegram, address, logo, favicon, social)
+     VALUES ('AvtoServis', 'Avto servis xizmati', '+998901234567', 'https://t.me/avtoservis',
+             'Toshkent', 'logo.png', 'fav.png', 'https://instagram.com/x')`
+  );
+  await legacyDb.end();
+  const legacyMig = spawn(process.execPath, ['scripts/migrate.js'], {
+    env: serverEnv({ DATABASE_URL: legacyUrl }),
+    cwd: SERVER_ROOT,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  check(await new Promise((res) => legacyMig.on('exit', res)) === 0, 'P14.0 the legacy database is converted');
+
+  const legacyPort = PORT + 2;
+  const legacyBase = `http://127.0.0.1:${legacyPort}`;
+  const legacy = spawn(process.execPath, [ENTRY], {
+    env: serverEnv({ PORT: String(legacyPort), DATABASE_URL: legacyUrl }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  extraChildren.push(legacy);
+  let legacyExit = null;
+  legacy.on('exit', (code) => { legacyExit = code; });
+
+  let ready = false;
+  for (let i = 0; i < 150 && !ready; i++) {
+    const res = await get('/api/health', legacyBase);
+    ready = res.status === 200;
+    if (!ready) await new Promise((r) => setTimeout(r, 200));
+  }
+  check(ready && legacyExit === null, 'P14.1 the converted legacy database boots cleanly', `ready=${ready} exit=${legacyExit}`);
+
+  const live = (await get('/api/public/settings', legacyBase)).data || {};
+  const site = live?.settings?.site || {};
+  check(site.name === 'AvtoServis' && site.phone === '+998901234567' && site.address === 'Toshkent',
+    'P14.2 the converted legacy settings are served and parsed', JSON.stringify(site).slice(0, 160));
+  check(site.social === 'https://instagram.com/x' && site.telegram === 'https://t.me/avtoservis',
+    'P14.3 legacy columns the current code never reads are still exposed', JSON.stringify(site).slice(0, 160));
+  const svc = await get('/api/public/services', legacyBase);
+  check(svc.status === 200 && svc.data?.services?.length === 5,
+    'P14.4 the default catalogue is seeded exactly once on the converted database',
+    `status=${svc.status} services=${svc.data?.services?.length}`);
+  const wl = await get('/api/public/worklogs', legacyBase);
+  check(wl.status === 200, 'P14.5 /api/public/worklogs answers 200 on the converted database', `status=${wl.status}`);
+}
+
 try {
   await main();
 } catch (err) {
   failures.push(`[fatal] ${err.message}`);
   console.error('\nFATAL:', err);
 } finally {
+  for (const c of extraChildren) c.kill('SIGTERM');
   if (child) child.kill('SIGTERM');
   await new Promise((r) => setTimeout(r, 300));
   if (child && child.exitCode === null) child.kill('SIGKILL');

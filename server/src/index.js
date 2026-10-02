@@ -66,17 +66,129 @@ async function withDbRetry(fn, { attempts = 3, baseDelayMs = 500, log = console.
 /**
  * Schema + defaults must be in place before the first request is served.
  *
- * Both steps are idempotent and guarded by an advisory lock inside `migrate()`,
- * so this is safe on every cold start even when several instances boot at once.
- * They are chained into a single promise the request layer awaits, instead of
- * being fired off and forgotten, which would let the first query race the
- * migration and fail with "relation does not exist".
+ * A failed attempt must not be remembered forever. `ready` used to be a single
+ * promise created at import time, which made one failed cold start fatal for the
+ * whole life of the instance: every later request saw the same rejected promise
+ * and answered 503, even after the database had become perfectly healthy again.
+ * On a serverless host that is very visible, because requests are spread over many
+ * instances -- some of which booted successfully and answer 200 while the ones
+ * that lost the startup race answer 503 indefinitely.
+ *
+ * The state below is therefore self-healing: a success is latched, but a failure
+ * only records the error and a backoff deadline, so a later request retries the
+ * sequence. Attempts are single-flighted, so concurrent requests trigger one run.
  */
-const ready = withDbRetry(() => migrate())
-  .then(() => withDbRetry(() => seed()))
+const STARTUP_RETRY_BASE_MS = Number(process.env.DB_STARTUP_RETRY_MS || 1000);
+const STARTUP_RETRY_MAX_MS = Number(process.env.DB_STARTUP_RETRY_MAX_MS || 30000);
+
+const startup = {
+  ready: false,
+  inFlight: null,
+  lastError: null,
+  failures: 0,
+  nextAttemptAt: 0,
+};
+
+/**
+ * Removes anything credential-shaped from text that is about to be logged.
+ *
+ * PostgreSQL connection errors can echo the connection target, and a caller can
+ * pass any error object, so the URL userinfo and `password=` parameters are
+ * masked before the message reaches the log.
+ */
+function sanitizeDbMessage(value) {
+  return String(value == null ? '' : value)
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]*@/gi, '$1***@')
+    .replace(/(password\s*=\s*)("?)[^\s&"']+\2/gi, '$1***')
+    .replace(/\b(sslkey|sslcert|sslpassword)=[^\s&]+/gi, '$1=***');
+}
+
+/** Names the failing stage so the log says which step broke, not just that one did. */
+function startupFailureText(err) {
+  const stage = (err && err.startupStage) || 'startup';
+  const code = (err && err.code) ? String(err.code) : 'no code';
+  const detail = sanitizeDbMessage((err && err.message) || err);
+  const attempts = err && err.attempts ? ` after ${err.attempts} attempt(s)` : '';
+  const statement = err && err.position ? ` (statement position ${err.position})` : '';
+  return `[db] startup failed during ${stage}${attempts}: ${code} ${detail}${statement}`;
+}
+
+/** Runs one stage and records its name on the error for the log above. */
+async function startupStage(name, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err && typeof err === 'object' && !err.startupStage) err.startupStage = name;
+    throw err;
+  }
+}
+
+async function runStartupSequence() {
+  await startupStage('migrate', () => withDbRetry(() => migrate()));
+  await startupStage('seed', () => withDbRetry(() => seed()));
   // Expired-session cleanup needs the sessions table, so it runs here rather
   // than at module load. It is opportunistic and never blocks startup.
-  .then(() => auth.pruneSessions().catch((err) => console.error('[auth] session prune failed:', err.message)));
+  await auth.pruneSessions().catch((err) => console.error('[auth] session prune failed:', sanitizeDbMessage(err.message)));
+}
+
+/**
+ * Resolves once the database is migrated and seeded, rejects while it is not.
+ *
+ * On failure the reason is logged once with the real PostgreSQL error, and the
+ * schema check is re-run so a mismatched table is still named explicitly. Both
+ * happen per failed attempt rather than per request, so a broken instance does
+ * not spam the database.
+ */
+function ensureReady() {
+  if (startup.ready) return Promise.resolve();
+  if (startup.inFlight) return startup.inFlight;
+
+  const now = Date.now();
+  if (startup.lastError && now < startup.nextAttemptAt) return Promise.reject(startup.lastError);
+
+  const attempt = (async () => {
+    await runStartupSequence();
+    startup.failures = 0;
+    startup.lastError = null;
+    startup.nextAttemptAt = 0;
+    startup.ready = true;
+  })()
+    .then(() => {
+      startup.inFlight = null;
+    })
+    .catch((err) => {
+      startup.inFlight = null;
+      startup.ready = false;
+      startup.failures += 1;
+      const delay = Math.min(STARTUP_RETRY_BASE_MS * 2 ** (startup.failures - 1), STARTUP_RETRY_MAX_MS);
+      startup.nextAttemptAt = Date.now() + delay;
+      console.error(startupFailureText(err));
+      // Supplementary only: the real PostgreSQL error is already logged above.
+      withDbRetry(checkSchema)
+        .then((status) => {
+          if (status.ok) return;
+          for (const p of status.problems) {
+            if (p.problem === 'table missing') {
+              console.error(`[db] table "${p.table}" is missing — run: npm run db:migrate -w server`);
+            } else {
+              console.error(
+                `[db] table "${p.table}" is missing column(s): ${p.missing.join(', ')} — ` +
+                  'an older schema is present; run: npm run db:migrate -w server'
+              );
+            }
+          }
+        })
+        .catch(() => {});
+      throw err;
+    });
+
+  // The middleware below is the only consumer, and it only attaches when the
+  // first request arrives. Without this the boot-time rejection is unhandled and
+  // Node kills the function before it can serve its own 503.
+  attempt.catch(() => {});
+  startup.inFlight = attempt;
+  return attempt;
+}
 
 /**
  * Holds every request until the schema and default settings exist.
@@ -84,36 +196,13 @@ const ready = withDbRetry(() => migrate())
  * Without this gate a request that arrives during the first cold start would
  * hit an unmigrated database and fail with "relation does not exist".
  * A startup failure is reported as 503 on every route rather than being an
- * unhandled rejection, so the process stays up and the provider can retry.
+ * unhandled rejection, so the process stays up, the provider can retry, and the
+ * next request after the backoff re-runs migrate and seed.
  */
 app.use((req, res, next) => {
-  ready.then(
+  ensureReady().then(
     () => next(),
-    (err) => {
-      console.error('[db] startup failed: ' + err.message);
-      // A pre-existing table with an incompatible shape is the usual cause on a
-      // migrated database. Naming the table and columns turns an opaque
-      // "column key does not exist" into something actionable.
-      withDbRetry(checkSchema)
-        .then((status) => {
-          if (status.ok) {
-            console.error('[db] schema check passed, so the failure is not a missing table or column');
-          } else {
-            for (const p of status.problems) {
-              if (p.problem === 'table missing') {
-                console.error(`[db] table "${p.table}" is missing — run: npm run db:migrate -w server`);
-              } else {
-                console.error(
-                  `[db] table "${p.table}" is missing column(s): ${p.missing.join(', ')} — ` +
-                    'an older schema is present; run: npm run db:migrate -w server'
-                );
-              }
-            }
-          }
-        })
-        .catch(() => {})
-        .finally(() => res.status(503).json({ error: 'Database is not ready' }));
-    }
+    () => res.status(503).json({ error: 'Database is not ready' })
   );
 });
 const PORT = process.env.PORT || 4000;
