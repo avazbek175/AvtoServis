@@ -4,12 +4,12 @@ const path = require('path');
 const { db } = require('../db');
 const storage = require('../storage');
 
-const router = express.Router();
-const uploadsDir = path.join(__dirname, '..', '..', 'uploads');
+const router = require('../asyncRoute').wrapRouter(express.Router());
+const uploadsDir = require('../paths').uploadsDir;
 
-router.get('/:filename', (req, res) => {
+router.get('/:filename', async (req, res) => {
   const filename = path.basename(String(req.params.filename)).replace(/[\\/]/g, '');
-  const row = db.prepare('SELECT object_key FROM media WHERE filename = ?').get(filename);
+  const row = await db.prepare('SELECT object_key FROM media WHERE filename = ?').get(filename);
 
   if (row && row.object_key && storage.enabled) {
     res.set('Cache-Control', 'public, max-age=31536000, immutable');

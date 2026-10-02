@@ -111,7 +111,7 @@ export default function AdminLayout() {
       </div>
 
       <ConfirmLogout open={confirm} onCancel={() => setConfirm(false)} onConfirm={doLogout} />
-      <ChangePasswordModal open={pwdOpen} onClose={() => setPwdOpen(false)} />
+      <ChangePasswordModal open={pwdOpen} onClose={() => setPwdOpen(false)} onPasswordChanged={doLogout} />
     </div>
   );
 }
@@ -128,7 +128,7 @@ function ConfirmLogout({ open, onCancel, onConfirm }) {
   );
 }
 
-function ChangePasswordModal({ open, onClose }) {
+function ChangePasswordModal({ open, onClose, onPasswordChanged }) {
   const [form, setForm] = useState({ current_password: '', new_password: '' });
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -138,9 +138,16 @@ function ChangePasswordModal({ open, onClose }) {
     setMsg(null);
     setBusy(true);
     try {
-      await api.post('/admin/change-password', form);
-      setMsg({ kind: 'success', text: 'Parol muvaffaqiyatli o\'zgartirildi' });
+      const res = await api.post('/admin/change-password', form);
       setForm({ current_password: '', new_password: '' });
+      if (res && res.reauth) {
+        // The server revokes every session on a password change, so send the user
+        // back to the login screen instead of leaving a dead cookie behind.
+        onClose();
+        onPasswordChanged();
+        return;
+      }
+      setMsg({ kind: 'success', text: 'Parol muvaffaqiyatli o\'zgartirildi' });
     } catch (err) {
       setMsg({ kind: 'error', text: err.message });
     } finally {

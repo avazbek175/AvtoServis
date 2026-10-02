@@ -321,7 +321,13 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
     setSaving(true);
     try {
       const payload = { ...form };
-      payload.is_public = isEdit ? (form.is_public ? 1 : 0) : (isSA ? (form.is_public ? 1 : 0) : 0);
+      // is_public faqat super admin tomonidan boshqariladi; usta yubormasligi kerak,
+      // aks holda server uni 403 bilan rad etadi (server alohida tekshiradi).
+      if (isSA) {
+        payload.is_public = form.is_public ? 1 : 0;
+      } else {
+        delete payload.is_public;
+      }
       if (isEdit) {
         await api.put('/admin/worklogs/' + initial.id, payload);
       } else {

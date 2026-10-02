@@ -4,10 +4,15 @@
   "private": true,
   "type": "commonjs",
   "main": "src/index.js",
+  "engines": {
+    "node": "24.x"
+  },
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "setup": "node scripts/setup.js"
+    "setup": "node scripts/setup.js",
+    "db:migrate": "node scripts/migrate.js",
+    "db:import-sqlite": "node scripts/import-sqlite.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1138.0",
@@ -17,6 +22,7 @@
     "dotenv": "^18.0.3",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
-    "multer": "^2.0.0"
+    "multer": "^2.0.0",
+    "pg": "^8.23.1"
   }
 }

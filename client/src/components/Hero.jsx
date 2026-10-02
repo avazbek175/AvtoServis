@@ -1,18 +1,27 @@
 import React from 'react';
 import { useSite } from '../store';
+import { safeHref } from '../safeUrl';
 import Icon from './icons';
 
 export default function Hero() {
   const { settings } = useSite();
   const hero = settings?.hero || {};
-  const site = settings?.site || {};
+  const about = settings?.about || {};
   if (hero.show === false) return null;
 
+  // `experience` lives in `about` — reading `hero.experience` silently fell back to
+  // the hardcoded "10+" even when the admin had configured a different value.
+  const experienceValue = about.experience === 0 || about.experience
+    ? `${about.experience}+`
+    : '10+';
+
   const stats = [
-    { value: '5000+', label: 'Homiylangan mijozlar' },
-    { value: hero.experience || '10+', label: site.name?.toLowerCase().includes('avto') ? "Yillik tajriba" : "Yillik tajriba" },
-    { value: '24/7', label: 'Doimiy yordam' },
+    { value: hero.stats_customers_value || '5000+', label: hero.stats_customers_label || 'Homiylangan mijozlar' },
+    { value: experienceValue, label: about.experience_label || 'Yillik tajriba' },
+    { value: hero.stats_support_value || '24/7', label: hero.stats_support_label || 'Doimiy yordam' },
   ];
+
+  const buttonLink = safeHref(hero.button_link) || '#services';
 
   return (
     <section id="home" className="relative flex min-h-[92vh] items-center overflow-hidden">
@@ -49,7 +58,7 @@ export default function Hero() {
             {hero.subtitle || ''}
           </p>
           <div className="mt-8 flex flex-wrap items-center justify-center gap-4 md:justify-start">
-            <a href={hero.button_link || '#services'} className="btn-primary group text-base">
+            <a href={buttonLink} className="btn-primary group text-base">
               {hero.button_text || 'Xizmatlar'}
               <Icon name="arrow" size={18} className="transition-transform duration-200 group-hover:translate-x-1" />
             </a>

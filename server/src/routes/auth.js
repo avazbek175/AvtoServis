@@ -1,28 +1,76 @@
 const express = require('express');
+const crypto = require('crypto');
 const { db } = require('../db');
 const auth = require('../auth');
+const rateLimit = require('../rateLimit');
 
-const router = express.Router();
+const router = require('../asyncRoute').wrapRouter(express.Router());
 
 const PUBLIC_USER_FIELDS = 'id, full_name, username, email, role, is_active, created_at';
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,30}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PG_UNIQUE_VIOLATION = '23505';
 
-function countSuperAdmins() {
-  return db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'super_admin'").get().c;
+async function countSuperAdmins() {
+  const row = await db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'super_admin'").get();
+  return Number(row.c);
 }
 
-router.post('/login', (req, res) => {
+/**
+ * Guards the first-super-admin bootstrap endpoint.
+ *
+ * On an empty database this route creates an account with full control, so on a
+ * freshly deployed instance anyone could reach it and take the site over. In
+ * production it therefore requires a secret that only the operator knows:
+ *
+ *   Authorization: Bearer <SETUP_SECRET>   (or the X-Setup-Secret header)
+ *
+ * If SETUP_SECRET is missing in production the endpoint stays closed (fail
+ * closed) rather than falling back to open. The secret is never echoed in a
+ * response or written to a log.
+ */
+function requireSetupSecret(req, res, next) {
+  const configured = String(process.env.SETUP_SECRET || '').trim();
+
+  if (!configured) {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({
+        error: 'Setup o\'chirilgan. Birinchi admin yaratish uchun SETUP_SECRET sozlang',
+      });
+    }
+    // Development keeps the convenient local behaviour.
+    return next();
+  }
+
+  const header = req.headers.authorization || '';
+  const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const provided = String(bearer || req.headers['x-setup-secret'] || '').trim();
+  if (!provided) {
+    return res.status(401).json({ error: 'Setup secret talab qilinadi' });
+  }
+
+  const a = Buffer.from(provided);
+  const b = Buffer.from(configured);
+  const matches = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (!matches) {
+    return res.status(403).json({ error: 'Setup secret noto\'g\'ri' });
+  }
+  return next();
+}
+
+// Only the login route is throttled — see rateLimit.js for why the budget is not shared.
+router.post('/login', rateLimit.loginRateLimit, async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ error: 'Login va parol kiritilishi shart' });
   }
 
-  const user = db
+  const user = await db
     .prepare('SELECT * FROM users WHERE username = ? OR email = ?')
     .get(String(username).trim(), String(username).trim());
 
   if (!user || !auth.verifyPassword(String(password), user.password_hash)) {
+    rateLimit.recordFailure(req);
     return res.status(401).json({ error: 'Login yoki parol noto\'g\'ri' });
   }
 
@@ -30,20 +78,21 @@ router.post('/login', (req, res) => {
     return res.status(403).json({ error: 'Hisob faolshtirilgan. Administrator bilan bog\'laning' });
   }
 
-  const token = auth.createSessionToken(user);
+  rateLimit.recordSuccess(req);
+  const token = await auth.createSessionToken(user);
   auth.setAuthCookie(res, token);
 
   res.json({ user: publicUser(user) });
 });
 
-router.post('/logout', (req, res) => {
-  auth.revokeToken(req);
+router.post('/logout', async (req, res) => {
+  await auth.revokeToken(req);
   auth.clearAuthCookie(res);
   res.json({ ok: true });
 });
 
-router.get('/me', auth.authenticate, (req, res) => {
-  const user = db.prepare('SELECT ' + PUBLIC_USER_FIELDS + ' FROM users WHERE id = ?').get(req.user.id);
+router.get('/me', auth.authenticate, async (req, res) => {
+  const user = await db.prepare('SELECT ' + PUBLIC_USER_FIELDS + ' FROM users WHERE id = ?').get(req.user.id);
   if (!user || !user.is_active) {
     auth.clearAuthCookie(res);
     return res.status(401).json({ error: 'Foydalanuvchi topilmadi' });
@@ -51,12 +100,14 @@ router.get('/me', auth.authenticate, (req, res) => {
   res.json({ user });
 });
 
-router.get('/setup-status', (req, res) => {
-  res.json({ needsSetup: countSuperAdmins() === 0 });
+router.get('/setup-status', async (req, res) => {
+  res.json({ needsSetup: (await countSuperAdmins()) === 0 });
 });
 
-router.post('/setup', (req, res) => {
-  if (countSuperAdmins() > 0) {
+router.post('/setup', requireSetupSecret, async (req, res) => {
+  // Checked again after the secret so a valid secret cannot be replayed once an
+  // admin exists; this also closes the endpoint automatically after first use.
+  if ((await countSuperAdmins()) > 0) {
     return res.status(403).json({ error: 'Super admin allaqachon yaratilgan' });
   }
 
@@ -80,22 +131,25 @@ router.post('/setup', (req, res) => {
   }
   try {
     const hash = auth.hashPassword(String(password));
-    const info = db
-      .prepare('INSERT INTO users (full_name, username, email, password_hash, role, permissions, is_active) VALUES (?, ?, ?, ?, ?, \'[]\', 1)')
-      .run(String(full_name).trim(), u, e, hash, 'super_admin');
-    const user = db.prepare('SELECT ' + PUBLIC_USER_FIELDS + ' FROM users WHERE id = ?').get(info.lastInsertRowid);
-    const token = auth.createSessionToken(user);
+    // RETURNING replaces SQLite's last_insert_rowid().
+    const user = await db
+      .prepare(
+        "INSERT INTO users (full_name, username, email, password_hash, role, permissions, is_active) VALUES (?, ?, ?, ?, ?, '[]', 1) RETURNING " +
+          PUBLIC_USER_FIELDS
+      )
+      .one(String(full_name).trim(), u, e, hash, 'super_admin');
+    const token = await auth.createSessionToken(user);
     auth.setAuthCookie(res, token);
     return res.status(201).json({ user });
   } catch (err) {
-    if (String(err.message).includes('UNIQUE')) {
+    if (err && (err.code === PG_UNIQUE_VIOLATION || String(err.message).includes('UNIQUE'))) {
       return res.status(409).json({ error: 'Username yoki email band' });
     }
     throw err;
   }
 });
 
-router.post('/apply', (req, res) => {
+router.post('/apply', async (req, res) => {
   const b = req.body || {};
   const full_name = String(b.full_name || '').trim();
   const phone = String(b.phone || '').trim();
@@ -127,27 +181,26 @@ router.post('/apply', (req, res) => {
     return res.status(400).json({ error: 'Qo\'shimcha ma\'lumot juda uzun' });
   }
 
-  const existing = db
-    .prepare("SELECT COUNT(*) c FROM users WHERE username = ? OR email = ?")
-    .get(username, email).c;
-  if (existing > 0) {
+  const existing = await db
+    .prepare('SELECT COUNT(*) c FROM users WHERE username = ? OR email = ?')
+    .get(username, email);
+  if (Number(existing.c) > 0) {
     return res.status(409).json({ error: 'Bunday login yoki email allaqachon ro\'yxatdan o\'tgan' });
   }
 
-  const dupe = db
+  const dupe = await db
     .prepare("SELECT COUNT(*) c FROM master_applications WHERE status IN ('pending','approved') AND (username = ? OR email = ?)")
-    .get(username, email).c;
-  if (dupe > 0) {
+    .get(username, email);
+  if (Number(dupe.c) > 0) {
     return res.status(409).json({ error: 'Bu login yoki email bo\'yicha ariza allaqachon yuborilgan' });
   }
 
   const hash = auth.hashPassword(password);
-  const info = db
-    .prepare('INSERT INTO master_applications (full_name, phone, email, username, password_hash, specialty, message, status) VALUES (?, ?, ?, ?, ?, ?, ?, \'pending\')')
-    .run(full_name, phone, email, username, hash, specialty, message);
-  const app = db
-    .prepare('SELECT id, full_name, phone, email, username, specialty, message, status, created_at FROM master_applications WHERE id = ?')
-    .get(info.lastInsertRowid);
+  const app = await db
+    .prepare(
+      "INSERT INTO master_applications (full_name, phone, email, username, password_hash, specialty, message, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending') RETURNING id, full_name, phone, email, username, specialty, message, status, created_at"
+    )
+    .one(full_name, phone, email, username, hash, specialty, message);
   res.status(201).json({ application: app });
 });
 

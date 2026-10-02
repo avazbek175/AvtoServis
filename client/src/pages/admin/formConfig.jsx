@@ -2,6 +2,9 @@ import React from 'react';
 import ImagePicker from '../../components/ImagePicker';
 import { Toggle } from '../../components/ui';
 
+const HEX_COLOR = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+const isHexColor = (v) => typeof v === 'string' && HEX_COLOR.test(v.trim());
+
 export function Field({ field, value, onChange }) {
   const set = (v) => onChange(field.key, v);
 
@@ -26,16 +29,37 @@ export function Field({ field, value, onChange }) {
           <Toggle checked={!!value} onChange={set} />
         </div>
       );
-    case 'color':
+    case 'color': {
+      const text = typeof value === 'string' ? value.trim() : '';
+      const valid = !text || /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(text);
       return (
         <div>
           <label className="label">{field.label}</label>
           <div className="flex items-center gap-3">
-            <input type="color" value={value || '#e11d2e'} onChange={(e) => set(e.target.value)} className="h-10 w-14 cursor-pointer rounded-lg border border-white/10 bg-transparent" />
-            <input className="field flex-1" value={value || ''} onChange={(e) => set(e.target.value)} placeholder="#e11d2e" />
+            <input
+              type="color"
+              value={isHexColor(text) ? text : '#e11d2e'}
+              onChange={(e) => set(e.target.value)}
+              className="h-10 w-14 cursor-pointer rounded-lg border border-white/10 bg-transparent"
+            />
+            <div className="flex-1">
+              <input
+                className={`field ${text && !valid ? 'border-rose-500/60' : ''}`}
+                value={text}
+                onChange={(e) => set(e.target.value)}
+                placeholder="#e11d2e"
+              />
+              {text && !valid && (
+                <p className="mt-1 text-xs text-rose-400">
+                  Noto&apos;g&apos;ri rang. Format: #fff, #ffffff yoki #ffffff80
+                </p>
+              )}
+            </div>
           </div>
+          {field.hint && valid && <p className="mt-1 text-xs text-white/35">{field.hint}</p>}
         </div>
       );
+    }
     case 'select':
       return (
         <div>
@@ -89,14 +113,18 @@ export const KEY_FIELDS = {
     { key: 'subtitle', label: 'Hero matn', type: 'textarea' },
     { key: 'background_image', label: 'Fon rasmi', type: 'image' },
     { key: 'button_text', label: 'Tugma matni', type: 'text' },
-    { key: 'button_link', label: 'Tugma havolasi', type: 'text', placeholder: '#services' },
+    { key: 'button_link', label: 'Tugma havolasi', type: 'text', placeholder: '#services', hint: 'Faqat https://, http:// yoki / bilan boshlanadigan havolalar ruxsat etiladi' },
+    { key: 'stats_customers_value', label: 'Statistika 1 — qiymat', type: 'text', placeholder: '5000+' },
+    { key: 'stats_customers_label', label: 'Statistika 1 — yozuv', type: 'text', placeholder: 'Homiylangan mijozlar' },
+    { key: 'stats_support_value', label: 'Statistika 3 — qiymat', type: 'text', placeholder: '24/7' },
+    { key: 'stats_support_label', label: 'Statistika 3 — yozuv', type: 'text', placeholder: 'Doimiy yordam' },
   ],
   about: [
     { key: 'show', label: 'Bo\'limni ko\'rsatish', type: 'toggle' },
     { key: 'title', label: 'Sarlavha', type: 'text' },
     { key: 'description', label: 'Matn (tavsif)', type: 'textarea' },
     { key: 'image', label: 'Rasm', type: 'image' },
-    { key: 'experience', label: 'Tajriba (yil)', type: 'number' },
+    { key: 'experience', label: 'Tajriba (yil) — Hero statistikasida ham ko\'rsatiladi', type: 'number' },
     { key: 'experience_label', label: 'Tajriba yozuvi', type: 'text', placeholder: 'Yillik tajriba' },
   ],
   contact: [

@@ -7,27 +7,62 @@ const { db } = require('./db');
 
 const ROLES = ['super_admin', 'master'];
 
-const SECRET_FILE = path.join(__dirname, '..', 'data', 'secret.key');
+const SECRET_FILE = require('./paths').secretFile;
 let secret = '';
 
 function ensureSecret() {
   if (secret) return secret;
+
+  // On Vercel the app directory is read-only and each instance has its own
+  // filesystem, so a generated secret.key would invalidate every cookie issued by
+  // any other instance (and change on each cold start). JWT_SECRET must be set
+  // there; the file stays as the local fallback.
+  const fromEnv = String(process.env.JWT_SECRET || '').trim();
+  if (fromEnv) {
+    secret = fromEnv;
+    return secret;
+  }
+
   const dir = path.dirname(SECRET_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(SECRET_FILE)) {
-    secret = crypto.randomBytes(48).toString('hex');
-    fs.writeFileSync(SECRET_FILE, secret, { mode: 0o600 });
-  } else {
-    secret = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(SECRET_FILE)) {
+      secret = crypto.randomBytes(48).toString('hex');
+      fs.writeFileSync(SECRET_FILE, secret, { mode: 0o600 });
+    } else {
+      secret = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+    }
+  } catch (err) {
+    // A read-only filesystem (serverless) or a missing directory must produce a
+    // clear message instead of a raw EACCES/ENOENT stack trace.
+    throw new Error(
+      'JWT_SECRET could not be loaded from ' + SECRET_FILE + ' (' + err.message + '). ' +
+        'Set the JWT_SECRET environment variable to a fixed random value.'
+    );
   }
   return secret;
+}
+
+/**
+ * Production must have an explicit JWT_SECRET.
+ *
+ * Generating one per instance would silently sign cookies with a different key
+ * on every cold start, so users would be logged out at random and no session
+ * could ever be validated across instances.
+ */
+function assertProductionConfig() {
+  if (process.env.NODE_ENV !== 'production') return;
+  if (String(process.env.JWT_SECRET || '').trim()) return;
+  throw new Error(
+    'JWT_SECRET is required in production. Generate one with: openssl rand -hex 48'
+  );
 }
 
 const COOKIE_NAME = 'avtoservis_token';
 const MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 
-function pruneSessions() {
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+async function pruneSessions() {
+  await db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
 }
 
 function hashPassword(password) {
@@ -38,12 +73,13 @@ function verifyPassword(password, hash) {
   return bcrypt.compareSync(password, hash);
 }
 
-function createSessionToken(user) {
+async function createSessionToken(user) {
   ensureSecret();
   const tokenId = crypto.randomUUID();
   const expiresAt = Date.now() + MAX_AGE;
-  db.prepare('INSERT INTO sessions (token_id, user_id, expires_at) VALUES (?, ?, ?)')
-    .run(tokenId, user.id, expiresAt);
+  await db
+    .prepare('INSERT INTO sessions (token_id, user_id, expires_at) VALUES (?, ?, ?) RETURNING token_id')
+    .one(tokenId, user.id, expiresAt);
   const token = jwt.sign(
     { uid: user.id, role: user.role, jti: tokenId },
     secret,
@@ -77,31 +113,23 @@ function decodePayload(token) {
   return jwt.verify(token, secret);
 }
 
-function revokeToken(req) {
+async function revokeToken(req) {
   const token = readToken(req);
   if (!token) return;
   try {
     const payload = decodePayload(token);
     if (payload && payload.jti) {
-      db.prepare('DELETE FROM sessions WHERE token_id = ?').run(payload.jti);
+      await db.prepare('DELETE FROM sessions WHERE token_id = ?').run(payload.jti);
     }
   } catch {
   }
 }
 
-function revokeUserSessionsExcept(userId, keepTokenId) {
-  if (keepTokenId) {
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_id != ?').run(userId, keepTokenId);
-  } else {
-    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
-  }
+async function revokeUserSessions(userId) {
+  await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
 }
 
-function revokeUserSessions(userId) {
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
-}
-
-function authenticate(req, res, next) {
+async function authenticate(req, res, next) {
   const token = readToken(req);
   if (!token) {
     return res.status(401).json({ error: 'Not authenticated' });
@@ -110,19 +138,19 @@ function authenticate(req, res, next) {
     const payload = decodePayload(token);
     if (!payload || !payload.jti) return res.status(401).json({ error: 'Invalid session' });
 
-    const session = db
+    const session = await db
       .prepare('SELECT expires_at FROM sessions WHERE token_id = ? AND user_id = ?')
       .get(payload.jti, payload.uid);
-    if (!session || session.expires_at < Date.now()) {
+    if (!session || Number(session.expires_at) < Date.now()) {
       clearAuthCookie(res);
       return res.status(401).json({ error: 'Session expired or invalid' });
     }
 
-    const user = db
+    const user = await db
       .prepare('SELECT id, full_name, role, permissions, is_active FROM users WHERE id = ?')
       .get(payload.uid);
     if (!user || !user.is_active) {
-      db.prepare('DELETE FROM sessions WHERE token_id = ?').run(payload.jti);
+      await db.prepare('DELETE FROM sessions WHERE token_id = ?').run(payload.jti);
       clearAuthCookie(res);
       return res.status(401).json({ error: 'Account unavailable' });
     }
@@ -131,6 +159,8 @@ function authenticate(req, res, next) {
     req.tokenId = payload.jti;
     next();
   } catch {
+    // Unchanged from the SQLite version: any failure to validate the token
+    // results in a rejected request and a cleared cookie.
     clearAuthCookie(res);
     return res.status(401).json({ error: 'Session expired or invalid' });
   }
@@ -171,7 +201,9 @@ function authorizePermission(scope) {
   };
 }
 
-pruneSessions();
+// `pruneSessions` is deliberately NOT started at module load: this module is
+// required before migrations run, so the query would fail with
+// "relation sessions does not exist". index.js calls it after startup instead.
 
 module.exports = {
   COOKIE_NAME,
@@ -183,10 +215,11 @@ module.exports = {
   clearAuthCookie,
   revokeToken,
   revokeUserSessions,
-  revokeUserSessionsExcept,
   authenticate,
   authorize,
   authorizePermission,
   hasPermission,
+  pruneSessions,
+  assertProductionConfig,
   MAX_AGE,
 };

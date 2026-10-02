@@ -5,9 +5,11 @@ const multer = require('multer');
 const { db } = require('../db');
 const auth = require('../auth');
 const storage = require('../storage');
-const { getSetting, setSetting, getAllSettings } = require('../settings');
+const { getSetting, setSetting, getAllSettings, VALID_KEYS } = require('../settings');
+const { validateSettings } = require('../validate');
+const { uploadsDir } = require('../paths');
 
-const router = express.Router();
+const router = require('../asyncRoute').wrapRouter(express.Router());
 router.use(auth.authenticate);
 
 const MAX_IMAGE_SIZE = 6 * 1024 * 1024;
@@ -21,19 +23,26 @@ function uniqueFilename(original) {
 
 const disk = multer.diskStorage({
   destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '..', '..', 'uploads');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
+    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+    cb(null, uploadsDir);
   },
   filename: (req, file, cb) => cb(null, uniqueFilename(file.originalname)),
 });
 
 const upload = multer({
-  storage: disk,
+  // R2 configured -> the file is buffered in memory and pushed straight to the
+  // bucket, so no temporary file is written. This is required on a serverless
+  // host whose filesystem is read-only. Disk storage stays for local dev
+  // without R2.
+  storage: storage.enabled ? multer.memoryStorage() : disk,
   limits: { fileSize: MAX_IMAGE_SIZE, files: 1 },
   fileFilter: (req, file, cb) => {
     if (!storage.isValidMime(file.mimetype)) {
-      return cb(new Error('Faqat JPG, PNG, WEBP, AVIF rasmlari ruxsat etiladi'));
+      // Multer passes plain Errors through untouched, so `status` is what makes
+      // the global error handler answer 400 instead of a generic 500.
+      const err = new Error('Faqat JPG, PNG, WEBP, AVIF rasmlari ruxsat etiladi');
+      err.status = 400;
+      return cb(err);
     }
     cb(null, true);
   },
@@ -43,14 +52,14 @@ function mediaUrl(item) {
   return item.object_key ? storage.publicUrl(item.object_key) : `/api/media/${item.filename}`;
 }
 
-function referencedUrlStrings() {
+async function referencedUrlStrings() {
   const refs = new Set();
-  for (const section of Object.values(getAllSettings())) {
+  for (const section of Object.values(await getAllSettings())) {
     for (const v of Object.values(section)) {
       if (typeof v === 'string' && v) refs.add(v);
     }
   }
-  for (const s of db.prepare('SELECT image FROM services').all()) {
+  for (const s of await db.prepare('SELECT image FROM services').all()) {
     if (s.image) refs.add(s.image);
   }
   return refs;
@@ -60,63 +69,69 @@ async function safeDeleteR2Url(url) {
   if (!storage.isR2Url(url)) return;
   const key = storage.keyFromUrl(url);
   if (!key) return;
-  const refs = referencedUrlStrings();
+  const refs = await referencedUrlStrings();
   if (refs.has(String(url))) return;
-  const inMedia = db.prepare('SELECT COUNT(*) c FROM media WHERE object_key = ?').get(key).c;
-  const inWork = db.prepare('SELECT COUNT(*) c FROM work_log_images WHERE object_key = ?').get(key).c;
-  if (inMedia + inWork > 0) return;
+  const inMedia = await db.prepare('SELECT COUNT(*) c FROM media WHERE object_key = ?').get(key);
+  const inWork = await db.prepare('SELECT COUNT(*) c FROM work_log_images WHERE object_key = ?').get(key);
+  if (Number(inMedia.c) + Number(inWork.c) > 0) return;
   await storage.remove(key).catch(() => {});
 }
 
 router.post('/uploads', auth.authorizePermission('media'), upload.single('file'), async (req, res, next) => {
   if (!req.file) return res.status(400).json({ error: 'Fayl yuklanmadi' });
+
+  // With memoryStorage there is no filename on disk; the DB row still needs a
+  // stable name because /api/media/:filename is the non-R2 fallback URL.
+  const filename = req.file.filename || uniqueFilename(req.file.originalname);
+  const removeLocal = () => {
+    if (req.file && req.file.path) fs.promises.unlink(req.file.path).catch(() => {});
+  };
+
+  let objectKey = '';
   try {
     const prefix = storage.normalizePrefix((req.body && req.body.prefix) || 'gallery');
-    let url = `/api/media/${req.file.filename}`;
-    let objectKey = '';
 
     if (storage.enabled) {
       objectKey = storage.makeKey(prefix, req.file.mimetype);
-      await storage.upload({
-        key: objectKey,
-        mime: req.file.mimetype,
-        body: fs.createReadStream(req.file.path),
-      });
-      await fs.promises.unlink(req.file.path).catch(() => {});
-      url = storage.publicUrl(objectKey);
+      await storage.upload({ key: objectKey, mime: req.file.mimetype, body: req.file.buffer });
+      removeLocal();
     }
 
-    const info = db
-      .prepare('INSERT INTO media (filename, original_name, mime, size, object_key) VALUES (?, ?, ?, ?, ?)')
-      .run(req.file.filename, req.file.originalname, req.file.mimetype, req.file.size, objectKey);
-    const row = db.prepare('SELECT id, filename, original_name, mime, size, object_key FROM media WHERE id = ?').get(info.lastInsertRowid);
+    // RETURNING replaces SQLite's last_insert_rowid().
+    const row = await db
+      .prepare('INSERT INTO media (filename, original_name, mime, size, object_key) VALUES (?, ?, ?, ?, ?) RETURNING id, filename, original_name, mime, size, object_key')
+      .one(filename, req.file.originalname, req.file.mimetype, req.file.size, objectKey);
+    const url = objectKey ? storage.publicUrl(objectKey) : `/api/media/${filename}`;
     res.status(201).json({ media: { ...row, url }, url });
   } catch (err) {
-    if (req.file && req.file.path) await fs.promises.unlink(req.file.path).catch(() => {});
+    // Either the R2 push or the metadata insert failed: undo the successful half
+    // so no orphan object and no row without a file is left behind.
+    removeLocal();
+    if (objectKey) await storage.remove(objectKey).catch(() => {});
     next(err);
   }
 });
 
-router.get('/media', auth.authorizePermission('media'), (req, res) => {
-  const items = db.prepare('SELECT id, filename, original_name, mime, size, object_key, created_at FROM media ORDER BY id DESC').all();
+router.get('/media', auth.authorizePermission('media'), async (req, res) => {
+  const items = await db.prepare('SELECT id, filename, original_name, mime, size, object_key, created_at FROM media ORDER BY id DESC').all();
   res.json({ media: items.map((m) => ({ ...m, url: mediaUrl(m) })) });
 });
 
 router.delete('/media/:id', auth.authorizePermission('media'), async (req, res, next) => {
-  const item = db.prepare('SELECT * FROM media WHERE id = ?').get(Number(req.params.id));
+  const item = await db.prepare('SELECT * FROM media WHERE id = ?').get(Number(req.params.id));
   if (!item) return res.status(404).json({ error: 'Media topilmadi' });
 
-  const refs = referencedUrlStrings();
+  const refs = await referencedUrlStrings();
   if (refs.has(`/api/media/${item.filename}`) || (item.object_key && refs.has(storage.publicUrl(item.object_key)))) {
     return res.status(409).json({ error: 'Bu rasm saytda ishlatilmoqda. Avval boshqa rasmni tanlang' });
   }
 
-  db.prepare('DELETE FROM media WHERE id = ?').run(Number(req.params.id));
+  await db.prepare('DELETE FROM media WHERE id = ?').run(Number(req.params.id));
   try {
     if (item.object_key) {
       await storage.remove(item.object_key);
     } else {
-      const filePath = path.join(__dirname, '..', '..', 'uploads', item.filename);
+      const filePath = path.join(uploadsDir, item.filename);
       await fs.promises.unlink(filePath).catch(() => {});
     }
   } catch (err) {
@@ -126,29 +141,28 @@ router.delete('/media/:id', auth.authorizePermission('media'), async (req, res, 
   res.json({ ok: true });
 });
 
-router.get('/services', auth.authorizePermission('services'), (req, res) => {
-  const services = db
+router.get('/services', auth.authorizePermission('services'), async (req, res) => {
+  const services = await db
     .prepare('SELECT * FROM services ORDER BY sort_order ASC, id ASC')
     .all();
   res.json({ services });
 });
 
-router.post('/services', auth.authorizePermission('services'), (req, res) => {
+router.post('/services', auth.authorizePermission('services'), async (req, res) => {
   const { name, description, benefits, image, icon, price, sort_order, is_active } = req.body || {};
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'Xizmat nomi kiritilishi shart' });
 
-  const maxOrder = db.prepare('SELECT COALESCE(MAX(sort_order), 0) m FROM services').get().m;
-  const info = db
+  const maxOrder = await db.prepare('SELECT COALESCE(MAX(sort_order), 0) m FROM services').get();
+  const service = await db
     .prepare(`INSERT INTO services (name, description, benefits, image, icon, price, sort_order, is_active)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(String(name).trim(), String(description || ''), String(benefits || ''), String(image || ''), String(icon || 'wrench'), String(price || ''), Number.isInteger(sort_order) ? sort_order : maxOrder + 1, is_active === false ? 0 : 1);
-  const service = db.prepare('SELECT * FROM services WHERE id = ?').get(info.lastInsertRowid);
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`)
+    .one(String(name).trim(), String(description || ''), String(benefits || ''), String(image || ''), String(icon || 'wrench'), String(price || ''), Number.isInteger(sort_order) ? sort_order : Number(maxOrder.m) + 1, is_active === false ? 0 : 1);
   res.status(201).json({ service });
 });
 
 router.put('/services/:id', auth.authorizePermission('services'), async (req, res, next) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM services WHERE id = ?').get(id);
+  const existing = await db.prepare('SELECT * FROM services WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Xizmat topilmadi' });
 
   const b = req.body || {};
@@ -158,10 +172,11 @@ router.put('/services/:id', auth.authorizePermission('services'), async (req, re
   const sort_order = Number.isInteger(b.sort_order) ? b.sort_order : existing.sort_order;
   const is_active = b.is_active !== undefined ? (b.is_active ? 1 : 0) : existing.is_active;
 
-  db.prepare(`UPDATE services SET
+  const service = await db.prepare(`UPDATE services SET
       name = ?, description = ?, benefits = ?, image = ?, icon = ?, price = ?, sort_order = ?, is_active = ?
-    WHERE id = ?`)
-    .run(
+    WHERE id = ?
+    RETURNING *`)
+    .one(
       name,
       b.description !== undefined ? String(b.description) : existing.description,
       b.benefits !== undefined ? String(b.benefits) : existing.benefits,
@@ -172,7 +187,6 @@ router.put('/services/:id', auth.authorizePermission('services'), async (req, re
       is_active,
       id
     );
-  const service = db.prepare('SELECT * FROM services WHERE id = ?').get(id);
 
   if (existing.image && b.image !== undefined && String(b.image) !== String(existing.image)) {
     try {
@@ -186,26 +200,24 @@ router.put('/services/:id', auth.authorizePermission('services'), async (req, re
   res.json({ service });
 });
 
-router.patch('/services/reorder', auth.authorizePermission('services'), (req, res) => {
+router.patch('/services/reorder', auth.authorizePermission('services'), async (req, res) => {
   const { ids } = req.body || {};
   if (!Array.isArray(ids)) return res.status(400).json({ error: 'Noto\'g\'ri so\'rov' });
-  const stmt = db.prepare('UPDATE services SET sort_order = ? WHERE id = ?');
-  db.exec('BEGIN');
-  try {
-    ids.forEach((id, idx) => stmt.run(idx + 1, Number(id)));
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  // All-or-nothing: a partially applied reorder would leave the list scrambled.
+  const stmt = 'UPDATE services SET sort_order = ? WHERE id = ?';
+  await db.transaction(async (t) => {
+    for (let idx = 0; idx < ids.length; idx++) {
+      await t.prepare(stmt).run(idx + 1, Number(ids[idx]));
+    }
+  });
   res.json({ ok: true });
 });
 
 router.delete('/services/:id', auth.authorizePermission('services'), async (req, res, next) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM services WHERE id = ?').get(id);
+  const existing = await db.prepare('SELECT * FROM services WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Xizmat topilmadi' });
-  db.prepare('DELETE FROM services WHERE id = ?').run(id);
+  await db.prepare('DELETE FROM services WHERE id = ?').run(id);
   if (existing.image) {
     try {
       await safeDeleteR2Url(existing.image);
@@ -221,22 +233,27 @@ router.get('/settings', auth.authorizePermission('content'), (req, res) => {
   res.json({ settings: getAllSettings(), keys: Object.keys(getAllSettings()) });
 });
 
-router.get('/settings/:key', auth.authorizePermission('content'), (req, res) => {
+router.get('/settings/:key', auth.authorizePermission('content'), async (req, res) => {
   const key = req.params.key;
-  const { VALID_KEYS } = require('../settings');
   if (!VALID_KEYS.includes(key)) return res.status(404).json({ error: 'Noma\'lum sozlamalar' });
-  res.json({ settings: getSetting(key) });
+  res.json({ settings: await getSetting(key) });
 });
 
 router.put('/settings/:key', auth.authorizePermission('content'), async (req, res, next) => {
   const key = req.params.key;
+  if (!VALID_KEYS.includes(key)) {
+    return res.status(400).json({ error: 'Noma\'lum sozlamalar kaliti' });
+  }
   if (key === 'worklog' && req.user.role !== 'super_admin') {
     return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
   }
   const value = req.body && req.body.value !== undefined ? req.body.value : req.body;
   try {
-    const prev = getSetting(key);
-    const saved = setSetting(key, value);
+    // Validation happens before anything is written, so a rejected payload can
+    // never reach the database or the rendered page.
+    validateSettings(key, value);
+    const prev = await getSetting(key);
+    const saved = await setSetting(key, value);
 
     const collectStrings = (obj, acc) => {
       if (!obj || typeof obj !== 'object') return acc;
@@ -259,14 +276,14 @@ router.put('/settings/:key', auth.authorizePermission('content'), async (req, re
   }
 });
 
-router.get('/users', auth.authorize('super_admin'), (req, res) => {
-  const users = db
+router.get('/users', auth.authorize('super_admin'), async (req, res) => {
+  const users = await db
     .prepare('SELECT id, full_name, username, email, role, permissions, is_active, created_at FROM users ORDER BY CASE role WHEN \'super_admin\' THEN 0 ELSE 1 END, id ASC')
     .all();
   res.json({ users });
 });
 
-router.post('/users', auth.authorize('super_admin'), (req, res) => {
+router.post('/users', auth.authorize('super_admin'), async (req, res) => {
   const b = req.body || {};
   const full_name = String(b.full_name || '').trim();
   const username = String(b.username || '').trim();
@@ -288,20 +305,22 @@ router.post('/users', auth.authorize('super_admin'), (req, res) => {
 
   const hash = auth.hashPassword(password);
   try {
-    const info = db
-      .prepare('INSERT INTO users (full_name, username, email, password_hash, role, permissions, is_active) VALUES (?, ?, ?, ?, \'master\', ?, ?)')
-      .run(full_name, username, email, hash, JSON.stringify(permissions), b.is_active === false ? 0 : 1);
-    const user = db.prepare('SELECT id, full_name, username, email, role, permissions, is_active, created_at FROM users WHERE id = ?').get(info.lastInsertRowid);
+    const user = await db
+      .prepare('INSERT INTO users (full_name, username, email, password_hash, role, permissions, is_active) VALUES (?, ?, ?, ?, \'master\', ?, ?) RETURNING id, full_name, username, email, role, permissions, is_active, created_at')
+      .one(full_name, username, email, hash, JSON.stringify(permissions), b.is_active === false ? 0 : 1);
     res.status(201).json({ user });
   } catch (err) {
-    if (String(err.message).includes('UNIQUE')) return res.status(409).json({ error: 'Username yoki email band' });
+    // 23505 = unique_violation (SQLite: UNIQUE constraint failed)
+    if (err.code === '23505' || String(err.message).includes('UNIQUE')) {
+      return res.status(409).json({ error: 'Username yoki email band' });
+    }
     throw err;
   }
 });
 
-router.put('/users/:id', auth.authorize('super_admin'), (req, res) => {
+router.put('/users/:id', auth.authorize('super_admin'), async (req, res) => {
   const id = Number(req.params.id);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   if (!user) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
 
   const b = req.body || {};
@@ -326,30 +345,33 @@ router.put('/users/:id', auth.authorize('super_admin'), (req, res) => {
   const is_active = b.is_active !== undefined ? (b.is_active ? 1 : 0) : user.is_active;
   const permissions = b.permissions !== undefined ? JSON.stringify(sanitizePermissions(b.permissions)) : user.permissions;
 
+  let passwordChanged = false;
   if (b.password) {
     if (String(b.password).length < 8) return res.status(400).json({ error: 'Parol kamida 8 belgidan iborat bo\'lishi kerak' });
     const hash = auth.hashPassword(String(b.password));
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
+    await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
+    passwordChanged = true;
   }
 
-  db.prepare('UPDATE users SET full_name = ?, username = ?, email = ?, role = ?, permissions = ?, is_active = ? WHERE id = ?')
-    .run(full_name, username, email, role, permissions, is_active, id);
-  const updated = db.prepare('SELECT id, full_name, username, email, role, permissions, is_active, created_at FROM users WHERE id = ?').get(id);
-  if (!is_active) auth.revokeUserSessions(id);
+  const updated = await db
+    .prepare('UPDATE users SET full_name = ?, username = ?, email = ?, role = ?, permissions = ?, is_active = ? WHERE id = ? RETURNING id, full_name, username, email, role, permissions, is_active, created_at')
+    .one(full_name, username, email, role, permissions, is_active, id);
+  // An admin-set password is a reset: every session opened with the old password dies.
+  if (!is_active || passwordChanged) await auth.revokeUserSessions(id);
   res.json({ user: updated });
 });
 
-router.delete('/users/:id', auth.authorize('super_admin'), (req, res) => {
+router.delete('/users/:id', auth.authorize('super_admin'), async (req, res) => {
   const id = Number(req.params.id);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   if (!user) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
   if (user.role === 'super_admin') {
-    const saCount = db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'super_admin' AND is_active = 1").get().c;
-    if (saCount <= 1) return res.status(409).json({ error: 'Oxirgi super adminni o\'chirib bo\'lmaydi' });
+    const saCount = await db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'super_admin' AND is_active = 1").get();
+    if (Number(saCount.c) <= 1) return res.status(409).json({ error: 'Oxirgi super adminni o\'chirib bo\'lmaydi' });
     return res.status(403).json({ error: 'Super adminni o\'chirib bo\'lmaydi' });
   }
-  auth.revokeUserSessions(id);
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  await auth.revokeUserSessions(id);
+  await db.prepare('DELETE FROM users WHERE id = ?').run(id);
   res.json({ ok: true });
 });
 
@@ -377,103 +399,143 @@ function publicApplication(app) {
   };
 }
 
-router.get('/applications', auth.authorize('super_admin'), (req, res) => {
+router.get('/applications', auth.authorize('super_admin'), async (req, res) => {
   const status = String(req.query.status || '');
   let rows;
   if (['pending', 'approved', 'rejected'].includes(status)) {
-    rows = db.prepare(`SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by WHERE a.status = ? ORDER BY a.created_at DESC, a.id DESC`).all(status);
+    rows = await db.prepare(`SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by WHERE a.status = ? ORDER BY a.created_at DESC, a.id DESC`).all(status);
   } else {
-    rows = db.prepare('SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by ORDER BY a.created_at DESC, a.id DESC').all();
+    rows = await db.prepare('SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by ORDER BY a.created_at DESC, a.id DESC').all();
   }
   res.json({ applications: rows.map(publicApplication) });
 });
 
-router.post('/applications/:id/approve', auth.authorize('super_admin'), (req, res) => {
+router.post('/applications/:id/approve', auth.authorize('super_admin'), async (req, res) => {
   const id = Number(req.params.id);
-  const app = db.prepare('SELECT * FROM master_applications WHERE id = ?').get(id);
+  const app = await db.prepare('SELECT * FROM master_applications WHERE id = ?').get(id);
   if (!app) return res.status(404).json({ error: 'Ariza topilmadi' });
   if (app.status !== 'pending') {
     return res.status(400).json({ error: 'Bu ariza allaqachon ko\'rib chiqilgan' });
   }
-  const taken = db
+  const taken = await db
     .prepare("SELECT COUNT(*) c FROM users WHERE username = ? OR email = ?")
-    .get(app.username, app.email).c;
-  if (taken > 0) {
+    .get(app.username, app.email);
+  if (Number(taken.c) > 0) {
     return res.status(409).json({ error: 'Bu login yoki email allaqachon band' });
   }
 
-  db.exec('BEGIN');
+  // Creating the user and marking the application approved must both happen or
+  // neither, so they share one transaction.
+  let user;
   try {
-    const info = db
-      .prepare("INSERT INTO users (full_name, username, email, password_hash, role, permissions, is_active) VALUES (?, ?, ?, ?, 'master', ?, 1)")
-      .run(
-        app.full_name,
-        app.username,
-        app.email,
-        app.password_hash,
-        JSON.stringify(['content', 'services', 'media'])
-      );
-    const user = db.prepare('SELECT id, full_name, username, email, role, is_active, created_at FROM users WHERE id = ?').get(info.lastInsertRowid);
-    db.prepare("UPDATE master_applications SET status = 'approved', reviewed_at = datetime('now'), reviewed_by = ? WHERE id = ?")
-      .run(req.user.id, id);
-    db.exec('COMMIT');
-    res.json({ user, application: publicApplication(db.prepare('SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by WHERE a.id = ?').get(id)) });
+    await db.transaction(async (t) => {
+      user = await t
+        .prepare("INSERT INTO users (full_name, username, email, password_hash, role, permissions, is_active) VALUES (?, ?, ?, ?, 'master', ?, 1) RETURNING id, full_name, username, email, role, is_active, created_at")
+        .one(
+          app.full_name,
+          app.username,
+          app.email,
+          app.password_hash,
+          JSON.stringify(['content', 'services', 'media'])
+        );
+      await t
+        .prepare("UPDATE master_applications SET status = 'approved', reviewed_at = app_now(), reviewed_by = ? WHERE id = ?")
+        .run(req.user.id, id);
+    });
   } catch (err) {
-    db.exec('ROLLBACK');
-    if (String(err.message).includes('UNIQUE')) {
+    if (err.code === '23505' || String(err.message).includes('UNIQUE')) {
       return res.status(409).json({ error: 'Username yoki email band' });
     }
     throw err;
   }
+  const updated = await db
+    .prepare('SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by WHERE a.id = ?')
+    .get(id);
+  res.json({ user, application: publicApplication(updated) });
 });
 
-router.post('/applications/:id/reject', auth.authorize('super_admin'), (req, res) => {
+router.post('/applications/:id/reject', auth.authorize('super_admin'), async (req, res) => {
   const id = Number(req.params.id);
-  const app = db.prepare('SELECT * FROM master_applications WHERE id = ?').get(id);
+  const app = await db.prepare('SELECT * FROM master_applications WHERE id = ?').get(id);
   if (!app) return res.status(404).json({ error: 'Ariza topilmadi' });
   if (app.status !== 'pending') {
     return res.status(400).json({ error: 'Bu ariza allaqachon ko\'rib chiqilgan' });
   }
   const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
-  db.prepare("UPDATE master_applications SET status = 'rejected', rejection_reason = ?, reviewed_at = datetime('now'), reviewed_by = ? WHERE id = ?")
+  await db
+    .prepare("UPDATE master_applications SET status = 'rejected', rejection_reason = ?, reviewed_at = app_now(), reviewed_by = ? WHERE id = ?")
     .run(reason, req.user.id, id);
-  res.json({ application: publicApplication(db.prepare('SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by WHERE a.id = ?').get(id)) });
+  const updated = await db
+    .prepare('SELECT a.*, u.full_name AS reviewed_by_name FROM master_applications a LEFT JOIN users u ON u.id = a.reviewed_by WHERE a.id = ?')
+    .get(id);
+  res.json({ application: publicApplication(updated) });
 });
 
-router.post('/change-password', (req, res) => {
+router.post('/change-password', async (req, res) => {
   const { current_password, new_password } = req.body || {};
   if (!current_password || !new_password) return res.status(400).json({ error: 'Barcha maydonlar to\'ldirilishi shart' });
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   if (!user) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
   if (!auth.verifyPassword(String(current_password), user.password_hash)) {
     return res.status(401).json({ error: 'Joriy parol noto\'g\'ri' });
   }
   if (String(new_password).length < 8) return res.status(400).json({ error: 'Yangi parol kamida 8 belgidan iborat bo\'lishi kerak' });
   const hash = auth.hashPassword(String(new_password));
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.user.id);
-  auth.revokeUserSessionsExcept(req.user.id, req.tokenId);
+  await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.user.id);
+  // A password change must invalidate every existing session, including the one
+  // that performed the change: a stolen cookie must not survive a reset.
+  await auth.revokeUserSessions(req.user.id);
+  auth.clearAuthCookie(res);
+  res.json({ ok: true, reauth: true });
+});
+
+// Detailed health for monitoring, authenticated and super-admin only. The public
+// /api/health deliberately returns nothing but { status: 'ok' }.
+router.get('/health', auth.authorize('super_admin'), async (req, res) => {
+  res.json({
+    status: 'ok',
+    users: (await db.prepare('SELECT COUNT(*) c FROM users').get()).c,
+    services: (await db.prepare('SELECT COUNT(*) c FROM services').get()).c,
+    sessions: (await db.prepare('SELECT COUNT(*) c FROM sessions WHERE expires_at >= ?').get(Date.now())).c,
+  });
+});
+
+// Optional query counter (DB_TRACE_QUERIES=1) used by the N+1 regression test.
+router.get('/diagnostics/queries', auth.authorize('super_admin'), (req, res) => {
+  if (!db.__getQueryCount) return res.status(404).json({ error: 'Query tracing yoqilgan (DB_TRACE_QUERIES=1)' });
+  res.json({ count: db.__getQueryCount() });
+});
+
+router.post('/diagnostics/queries/reset', auth.authorize('super_admin'), (req, res) => {
+  if (!db.__resetQueryCount) return res.status(404).json({ error: 'Query tracing yoqilgan (DB_TRACE_QUERIES=1)' });
+  db.__resetQueryCount();
   res.json({ ok: true });
 });
 
-router.get('/dashboard', (req, res) => {
-  const totalServices = db.prepare('SELECT COUNT(*) c FROM services').get().c;
-  const activeServices = db.prepare('SELECT COUNT(*) c FROM services WHERE is_active = 1').get().c;
-  const masters = db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'master'").get().c;
-  const mediaCount = db.prepare('SELECT COUNT(*) c FROM media').get().c;
-  const mastersActive = db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'master' AND is_active = 1").get().c;
+router.get('/dashboard', async (req, res) => {
+  const totalServices = (await db.prepare('SELECT COUNT(*) c FROM services').get()).c;
+  const activeServices = (await db.prepare('SELECT COUNT(*) c FROM services WHERE is_active = 1').get()).c;
+  const masters = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'master'").get()).c;
+  const mediaCount = (await db.prepare('SELECT COUNT(*) c FROM media').get()).c;
+  const mastersActive = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'master' AND is_active = 1").get()).c;
   const sections = ['site', 'hero', 'about', 'contact', 'footer'];
+  const [hero, about, design] = await Promise.all([
+    getSetting('hero'),
+    getSetting('about'),
+    getSetting('design'),
+  ]);
   const visible = {
-    hero: getSetting('hero').show !== false,
-    about: getSetting('about').show !== false && getSetting('design').show_about !== false,
-    services: getSetting('design').show_services !== false,
+    hero: hero.show !== false,
+    about: about.show !== false && design.show_about !== false,
+    services: design.show_services !== false,
   };
   for (const k of sections) {
-    const s = getSetting(k);
+    const s = await getSetting(k);
     if (s.show !== undefined) visible[k] = s.show !== false;
   }
   const stats = { totalServices, activeServices, masters, mastersActive, mediaCount };
   if (req.user.role === 'super_admin') {
-    stats.pendingApplications = db.prepare("SELECT COUNT(*) c FROM master_applications WHERE status = 'pending'").get().c;
+    stats.pendingApplications = (await db.prepare("SELECT COUNT(*) c FROM master_applications WHERE status = 'pending'").get()).c;
   }
   res.json({ stats, visible });
 });

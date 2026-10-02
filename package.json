@@ -13,6 +13,11 @@
     "dev:client": "npm run dev -w client",
     "build": "npm run build -w client",
     "start": "npm run start -w server",
+    "test": "node server/tests/api.test.mjs",
+    "test:prod": "NODE_ENV=production node server/tests/api.test.mjs",
     "install:all": "npm run setup -w server && npm install"
+  },
+  "devDependencies": {
+    "embedded-postgres": "^18.4.0-beta.17"
   }
 }

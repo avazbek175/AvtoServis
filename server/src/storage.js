@@ -12,11 +12,19 @@ const MIME_EXT = {
 const VALID_MIMES = Object.keys(MIME_EXT);
 const PREFIXES = ['services', 'oils', 'promotions', 'gallery'];
 
+/**
+ * Everything under this prefix is private and must only be reachable through an
+ * authenticated API route. It lives in a separate, non-public bucket when
+ * R2_PRIVATE_BUCKET_NAME is set, so a leaked public URL can never expose it.
+ */
+const PRIVATE_PREFIX = 'work';
+
 const config = {
   accountId: process.env.R2_ACCOUNT_ID || '',
   accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
   bucket: process.env.R2_BUCKET_NAME || 'avtoservis',
+  privateBucket: (process.env.R2_PRIVATE_BUCKET_NAME || '').trim(),
   endpoint: (process.env.R2_ENDPOINT || '').replace(/\/+$/, ''),
   publicUrl: (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, ''),
 };
@@ -29,6 +37,14 @@ const enabled =
       config.endpoint &&
       config.publicUrl
   );
+
+/** Private objects need a bucket of their own, otherwise a public URL would leak them. */
+const privateEnabled = Boolean(enabled && config.privateBucket);
+
+/** Picks the bucket a key belongs to. Routing by prefix keeps the DB schema unchanged. */
+function bucketForKey(key) {
+  return String(key || '').startsWith(`${PRIVATE_PREFIX}/`) ? config.privateBucket : config.bucket;
+}
 
 let client = null;
 if (enabled) {
@@ -60,6 +76,18 @@ function makeKey(prefix, mime) {
   return `${normalizePrefix(prefix)}/${crypto.randomUUID()}${ext}`;
 }
 
+/**
+ * Key for a work-log image. These are served only through
+ * /api/workimages/:filename, which checks per-work-log authorization, so they
+ * must not be reachable from the public bucket. When a private bucket is
+ * configured the object goes there; otherwise it falls back to the public
+ * bucket under the private prefix and stays subject to the same API checks.
+ */
+function makePrivateKey(mime) {
+  const ext = extForMime(mime) || '.bin';
+  return `${PRIVATE_PREFIX}/${crypto.randomUUID()}${ext}`;
+}
+
 function publicUrl(key) {
   if (!key) return '';
   return `${config.publicUrl}/${key}`;
@@ -77,11 +105,15 @@ function isR2Url(url) {
   return Boolean(keyFromUrl(url));
 }
 
+function isPrivateKey(key) {
+  return String(key || '').startsWith(`${PRIVATE_PREFIX}/`);
+}
+
 async function upload({ key, mime, body }) {
   if (!enabled || !client) throw new Error('R2 storage is not configured');
   await client.send(
     new PutObjectCommand({
-      Bucket: config.bucket,
+      Bucket: bucketForKey(key),
       Key: key,
       Body: body,
       ContentType: mime,
@@ -91,12 +123,12 @@ async function upload({ key, mime, body }) {
 
 async function remove(key) {
   if (!enabled || !client || !key) return;
-  await client.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: key }));
+  await client.send(new DeleteObjectCommand({ Bucket: bucketForKey(key), Key: key }));
 }
 
 async function getStream(key) {
   if (!enabled || !client) throw new Error('R2 storage is not configured');
-  const res = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: key }));
+  const res = await client.send(new GetObjectCommand({ Bucket: bucketForKey(key), Key: key }));
   return {
     stream: res.Body,
     contentType: res.ContentType,
@@ -107,6 +139,8 @@ async function getStream(key) {
 module.exports = {
   config,
   enabled,
+  privateEnabled,
+  PRIVATE_PREFIX,
   MIME_EXT,
   VALID_MIMES,
   PREFIXES,
@@ -114,6 +148,8 @@ module.exports = {
   isValidMime,
   normalizePrefix,
   makeKey,
+  makePrivateKey,
+  isPrivateKey,
   publicUrl,
   keyFromUrl,
   isR2Url,

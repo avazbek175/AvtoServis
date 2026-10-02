@@ -34,14 +34,23 @@ export function AppProvider({ children }) {
     const site = settings.site || {};
     const root = document.documentElement;
 
-    const hexToRgb = (hex) => {
-      const m = (hex || '').replace('#', '');
-      if (m.length === 3) return `${parseInt(m[0] + m[0], 16)} ${parseInt(m[1] + m[1], 16)} ${parseInt(m[2] + m[2], 16)}`;
-      if (m.length === 6) return `${parseInt(m.slice(0, 2), 16)} ${parseInt(m.slice(2, 4), 16)} ${parseInt(m.slice(4, 6), 16)}`;
-      return '225 29 46';
+    const hexToRgb = (hex, fallback) => {
+      // Values already in `rgb(var(--c-*))` space are written verbatim.
+      if (typeof hex === 'string' && hex.startsWith('rgb(')) return hex;
+      const raw = typeof hex === 'string' ? hex.trim() : '';
+      const m = raw.startsWith('#') ? raw.slice(1) : raw;
+      if (!/^(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(m)) return fallback;
+      const short = m.length <= 4;
+      const part = (i) => {
+        const chunk = short ? m[i] + m[i] : m.slice(i * 2, i * 2 + 2);
+        return parseInt(chunk, 16);
+      };
+      // The alpha byte (#RRGGBBAA) is intentionally ignored: the CSS custom property
+      // feeds `rgb(var(--c-primary))`, which has no alpha slot.
+      return `${part(0)} ${part(1)} ${part(2)}`;
     };
-    root.style.setProperty('--c-primary', hexToRgb(d.primary_color));
-    root.style.setProperty('--c-secondary', hexToRgb(d.secondary_color || '#0f1722'));
+    root.style.setProperty('--c-primary', hexToRgb(d.primary_color, '225 29 46'));
+    root.style.setProperty('--c-secondary', hexToRgb(d.secondary_color, '15 23 34'));
     root.style.setProperty('--font-sans', `'${d.font_family || 'Inter'}', system-ui, sans-serif`);
     const display = d.font_family === 'Manrope' ? 'Manrope' : d.font_family === 'Arial' ? 'Arial' : d.font_family === 'Georgia' ? 'Georgia' : d.font_family;
     root.style.setProperty('--font-heading', `'${display || 'Space Grotesk'}', 'Inter', system-ui, sans-serif`);

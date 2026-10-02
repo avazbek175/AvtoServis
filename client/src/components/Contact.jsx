@@ -1,5 +1,6 @@
 import React from 'react';
 import { useSite } from '../store';
+import { safeHref } from '../safeUrl';
 import Icon from './icons';
 import { SectionTitle } from './ui';
 
@@ -8,10 +9,11 @@ export default function Contact() {
   const c = settings?.contact || {};
   if (c.show === false) return null;
 
+  const mapLink = safeHref(c.map_link);
   const items = [
     { icon: 'phone', label: 'Telefon', value: c.phone, href: c.phone ? `tel:${c.phone.replace(/[^+\d]/g, '')}` : undefined },
-    { icon: 'telegram', label: 'Telegram', value: c.telegram || 'Telegram', href: c.telegram || undefined },
-    { icon: 'instagram', label: 'Instagram', value: c.instagram || 'Instagram', href: c.instagram || undefined },
+    { icon: 'telegram', label: 'Telegram', value: c.telegram || 'Telegram', href: safeHref(c.telegram) },
+    { icon: 'instagram', label: 'Instagram', value: c.instagram || 'Instagram', href: safeHref(c.instagram) },
     { icon: 'mail', label: 'Email', value: c.email, href: c.email ? `mailto:${c.email}` : undefined },
     { icon: 'pin', label: 'Manzil', value: c.address },
     { icon: 'clock', label: 'Ish vaqti', value: c.working_hours },
@@ -49,11 +51,11 @@ export default function Contact() {
           </div>
 
           <div className="lg:col-span-2">
-            {c.map_link ? (
+            {mapLink ? (
               <div className="card h-full overflow-hidden !p-0">
                 <iframe
                   title="Xarita"
-                  src={c.map_link}
+                  src={mapLink}
                   className="h-full min-h-[320px] w-full border-0"
                   loading="lazy"
                   referrerPolicy="no-referrer-when-downgrade"
