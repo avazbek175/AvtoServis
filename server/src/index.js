@@ -5,7 +5,7 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 
 const { seed } = require('./db');
-const { migrate } = require('./db/migrate');
+const { migrate, checkSchema } = require('./db/migrate');
 const auth = require('./auth');
 
 const authRouter = require('./routes/auth');
@@ -19,15 +19,61 @@ const { createCorsOptions, ConfigurationError } = require('./cors');
 const app = express();
 
 /**
+ * Connection-level failures worth retrying during startup.
+ *
+ * A cold start on a serverless host can race the provider's own failover or
+ * exhaust the connection pool while a neighbouring instance is migrating,
+ * which surfaces as `Connection terminated due to connection timeout` or a
+ * socket reset. Those are transient. A schema or SQL error is not, and must
+ * fail immediately so the real message is not hidden behind retries.
+ */
+const TRANSIENT_DB_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN',
+  '57P01',   // admin_shutdown
+  '57P02',   // crash_shutdown
+  '57P03',   // cannot_connect_now
+  '08000', '08003', '08006', '08001', '08004', // connection exceptions
+  '53300',   // too_many_connections
+]);
+
+function isTransientDbError(err) {
+  if (!err) return false;
+  if (TRANSIENT_DB_CODES.has(err.code)) return true;
+  // node-postgres surfaces a dropped socket as this message with no code.
+  return /Connection terminated|connection timeout|Client has encountered a connection error|timeout exceeded when trying to connect|server closed the connection/i.test(
+    String(err.message || '')
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Runs `fn`, retrying only transient connection failures. */
+async function withDbRetry(fn, { attempts = 3, baseDelayMs = 500, log = console.error } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= attempts || !isTransientDbError(err)) throw err;
+      const delay = baseDelayMs * 2 ** (attempt - 1);
+      log(`[db] transient connection failure (${err.code || err.message}), retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+}
+
+/**
  * Schema + defaults must be in place before the first request is served.
  *
- * Both steps are idempotent, so this is safe to run on every cold start. They
- * are chained into a single promise that the request layer awaits instead of
+ * Both steps are idempotent and guarded by an advisory lock inside `migrate()`,
+ * so this is safe on every cold start even when several instances boot at once.
+ * They are chained into a single promise the request layer awaits, instead of
  * being fired off and forgotten, which would let the first query race the
  * migration and fail with "relation does not exist".
  */
-const ready = migrate()
-  .then(() => seed())
+const ready = withDbRetry(() => migrate())
+  .then(() => withDbRetry(() => seed()))
   // Expired-session cleanup needs the sessions table, so it runs here rather
   // than at module load. It is opportunistic and never blocks startup.
   .then(() => auth.pruneSessions().catch((err) => console.error('[auth] session prune failed:', err.message)));
@@ -45,7 +91,28 @@ app.use((req, res, next) => {
     () => next(),
     (err) => {
       console.error('[db] startup failed: ' + err.message);
-      res.status(503).json({ error: 'Database is not ready' });
+      // A pre-existing table with an incompatible shape is the usual cause on a
+      // migrated database. Naming the table and columns turns an opaque
+      // "column key does not exist" into something actionable.
+      withDbRetry(checkSchema)
+        .then((status) => {
+          if (status.ok) {
+            console.error('[db] schema check passed, so the failure is not a missing table or column');
+          } else {
+            for (const p of status.problems) {
+              if (p.problem === 'table missing') {
+                console.error(`[db] table "${p.table}" is missing — run: npm run db:migrate -w server`);
+              } else {
+                console.error(
+                  `[db] table "${p.table}" is missing column(s): ${p.missing.join(', ')} — ` +
+                    'an older schema is present; run: npm run db:migrate -w server'
+                );
+              }
+            }
+          }
+        })
+        .catch(() => {})
+        .finally(() => res.status(503).json({ error: 'Database is not ready' }));
     }
   );
 });

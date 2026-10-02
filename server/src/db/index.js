@@ -68,31 +68,63 @@ const db = {
   __resetQueryCount: counter.reset,
   __traceEnabled: counter.enabled,
 };
-async function seed() {
-  for (const key of Object.keys(DEFAULT_SETTINGS)) {
-    await query(
-      toPgPlaceholders('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING'),
-      [key, JSON.stringify(DEFAULT_SETTINGS[key])]
-    );
-  }
+/**
+ * Advisory lock key for seeding.
+ *
+ * Distinct from the migration lock so a cold start never nests the two, and so
+ * seeding stays serialised even though migrations release their lock first.
+ */
+const SEED_LOCK_ID = 728411905518;
 
-  const { rows } = await query('SELECT COUNT(*) AS c FROM services');
-  if (Number(rows[0].c) === 0) {
-    const services = [
-      ['Mator xodovoy', 'Dvigatel va xodovoy qismlarni ta\'mirlash bo\'yicha to\'liq xizmat: kapital va joriy ta\'mirlash, moy va filtrlarni almashtirish.', 'Sifatli ehtiyot qismlar|Kafolatli ta\'mirlash|Tajribali ustalar', '', 'engine', '', 1],
-      ['Diagnostika', 'Komputer diagnostikasi yordamida avtomobilingizning barcha tizimlarini tekshiramiz.', 'Xatolarni aniq aniqlash|Tezkor natija|Sizga qulay vaqt', '', 'diagnostic', '', 2],
-      ['Programma', 'Avtomobil tizimlarini sozlash, chip tuning va dasturiy ta\'minotni yangilash xizmatlari.', 'Quvvat oshishi|Yoqilgan\'i tejalishi|Tizim barqarorligi', '', 'chip', '', 3],
-      ['Elektrik', 'Avtomobil elektr qismlarini diagnostika qilish va ta\'mirlash: starter, generator, simlar.', 'Zamonaviy uskunalar|Aniq sababni topish|Ishonchli ta\'mirlash', '', 'bolt', '', 4],
-      ['Moy almashtirish', 'Dvigatel moyi va filtrlarni tez va sifatli almashtirish. Barcha turdagi moylar.', 'Moy turini tanlashda yordam|Tez xizmat|Toza ish joyi', '', 'oil', '', 5],
-    ];
-    for (const s of services) {
-      await query(
-        toPgPlaceholders(
-          'INSERT INTO services (name, description, benefits, image, icon, price, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
-        ),
-        s
+/**
+ * Inserts the default settings and the default service catalogue.
+ *
+ * Safe on every cold start and safe to call concurrently: the lock makes the
+ * check-then-insert below atomic per database, and the settings upsert is
+ * idempotent by primary key.
+ *
+ * The lock is preferred over a unique index on `services(sort_order)` because
+ * admins can set arbitrary sort orders, so existing production data may already
+ * contain duplicates. Creating a unique index over that data would fail and
+ * block startup, whereas a lock never touches existing rows.
+ */
+async function seed() {
+  const client = await pool.connect();
+  let locked = false;
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [String(SEED_LOCK_ID)]);
+    locked = true;
+
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      await client.query(
+        toPgPlaceholders('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING'),
+        [key, JSON.stringify(DEFAULT_SETTINGS[key])]
       );
     }
+
+    const { rows } = await client.query('SELECT COUNT(*) AS c FROM services');
+    if (Number(rows[0].c) === 0) {
+      const services = [
+        ['Mator xodovoy', 'Dvigatel va xodovoy qismlarni ta\'mirlash bo\'yicha to\'liq xizmat: kapital va joriy ta\'mirlash, moy va filtrlarni almashtirish.', 'Sifatli ehtiyot qismlar|Kafolatli ta\'mirlash|Tajribali ustalar', '', 'engine', '', 1],
+        ['Diagnostika', 'Komputer diagnostikasi yordamida avtomobilingizning barcha tizimlarini tekshiramiz.', 'Xatolarni aniq aniqlash|Tezkor natija|Sizga qulay vaqt', '', 'diagnostic', '', 2],
+        ['Programma', 'Avtomobil tizimlarini sozlash, chip tuning va dasturiy ta\'minotni yangilash xizmatlari.', 'Quvvat oshishi|Yoqilgan\'i tejalishi|Tizim barqarorligi', '', 'chip', '', 3],
+        ['Elektrik', 'Avtomobil elektr qismlarini diagnostika qilish va ta\'mirlash: starter, generator, simlar.', 'Zamonaviy uskunalar|Aniq sababni topish|Ishonchli ta\'mirlash', '', 'bolt', '', 4],
+        ['Moy almashtirish', 'Dvigatel moyi va filtrlarni tez va sifatli almashtirish. Barcha turdagi moylar.', 'Moy turini tanlashda yordam|Tez xizmat|Toza ish joyi', '', 'oil', '', 5],
+      ];
+      for (const s of services) {
+        await client.query(
+          toPgPlaceholders(
+            'INSERT INTO services (name, description, benefits, image, icon, price, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
+          ),
+          s
+        );
+      }
+    }
+  } finally {
+    if (locked) {
+      await client.query('SELECT pg_advisory_unlock($1)', [String(SEED_LOCK_ID)]).catch(() => {});
+    }
+    client.release();
   }
 }
 

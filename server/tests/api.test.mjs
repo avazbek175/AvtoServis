@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import EmbeddedPostgres from 'embedded-postgres';
+import pgDriver from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_ROOT = path.join(__dirname, '..');
@@ -25,6 +26,9 @@ const UPLOADS_DIR = path.join(SERVER_ROOT, 'uploads');
 const PG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'avtoservis-pg-'));
 const PG_PORT = Number(process.env.TEST_PG_PORT || 55432);
 const PG_DB = 'avtoservis_test';
+// A second database in the same cluster, used to reproduce the production
+// situation where `settings` already exists with the legacy wide-row shape.
+const PG_LEGACY_DB = 'avtoservis_legacy_test';
 const PG_USER = 'avtoservis';
 const PG_PASSWORD = 'avtoservis_test_pw';
 const PORT = Number(process.env.TEST_PORT || 4321);
@@ -971,6 +975,199 @@ async function securityTests(ctx) {
   const sample = after.res.data.worklogs[0]?.images?.[0];
   check(sample && typeof sample.image_path === 'string' && sample.id !== undefined && !('work_log_id' in sample),
     'P9.8 image rows keep the original public shape', JSON.stringify(sample));
+
+  // ================================================== P12. legacy settings
+  await legacySettingsTests();
+}
+
+/** Runs the real migration CLI against the legacy database. */
+function migrateLegacyDb() {
+  return new Promise((resolve) => {
+    const c = spawn(process.execPath, ['scripts/migrate.js'], {
+      env: serverEnv({ DATABASE_URL: `postgresql://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${PG_LEGACY_DB}` }),
+      cwd: SERVER_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    c.stdout.on('data', (d) => (out += d));
+    c.stderr.on('data', (d) => (out += d));
+    c.on('exit', (code) => resolve({ code, out }));
+  });
+}
+
+/** Reads checkSchema() in a child process, since the module binds its own pool. */
+function checkSchemaIn(db) {
+  return new Promise((resolve) => {
+    const script = "const{checkSchema}=require('./src/db/migrate');const{pool}=require('./src/db/pool');"
+      + 'checkSchema().then(s=>{console.log(JSON.stringify(s));return pool.end()})'
+      + '.catch(e=>{console.error(e.message);process.exit(1)})';
+    const c = spawn(process.execPath, ['-e', script], {
+      env: serverEnv({ DATABASE_URL: `postgresql://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${db}` }),
+      cwd: SERVER_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    c.stdout.on('data', (d) => (out += d));
+    c.stderr.on('data', (d) => (out += d));
+    c.on('exit', (code) => resolve({ code, out: out.trim() }));
+  });
+}
+
+function legacyClient() {
+  return new pgDriver.Client({
+    host: '127.0.0.1', port: PG_PORT, user: PG_USER, password: PG_PASSWORD, database: PG_LEGACY_DB,
+  });
+}
+
+/**
+ * A database created before the key/value redesign has one wide `settings` row.
+ * `001_init.sql` used `CREATE TABLE IF NOT EXISTS`, so it skipped that table
+ * without complaint and startup then died with
+ * `column "key" of relation "settings" does not exist`.
+ */
+async function legacySettingsTests() {
+  group('P12. Legacy settings migration (Supabase shape)');
+  await pg.createDatabase(PG_LEGACY_DB);
+  const db = legacyClient();
+  await db.connect();
+
+  await db.query(`CREATE TABLE settings (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    description TEXT,
+    phone TEXT,
+    telegram TEXT,
+    address TEXT,
+    logo TEXT,
+    favicon TEXT,
+    social TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  await db.query(
+    `INSERT INTO settings (name, description, phone, telegram, address, logo, favicon, social)
+     VALUES ('AvtoServis', 'Avto servis xizmati', '+998901234567', 'https://t.me/avtoservis',
+             'Toshkent', 'logo.png', 'fav.png', 'https://instagram.com/x')`
+  );
+
+  const before = await checkSchemaIn(PG_LEGACY_DB);
+  const beforeStatus = (() => { try { return JSON.parse(before.out); } catch { return null; } })();
+  const settingsProblem = beforeStatus?.problems?.find((p) => p.table === 'settings');
+  check(beforeStatus?.ok === false && settingsProblem?.problem === 'columns missing'
+    && settingsProblem.missing.includes('key'),
+    'P12.1 schema check names the missing settings.key column', before.out.slice(0, 200));
+
+  const first = await migrateLegacyDb();
+  check(first.code === 0, 'P12.2 migration CLI succeeds against the legacy database',
+    first.out.split('\n').filter((l) => /error/i.test(l)).join(' | ').slice(0, 300));
+  check(first.out.includes('applied 002_settings_key_value.sql'), 'P12.3 conversion migration applied', first.out.slice(0, 300));
+
+  const after = await checkSchemaIn(PG_LEGACY_DB);
+  check(after.out.includes('"ok":true'), 'P12.4 schema check passes after the conversion', after.out.slice(0, 200));
+
+  const site = await db.query('SELECT value FROM settings WHERE key = $1', ['site']);
+  const doc = site.rows[0] ? JSON.parse(site.rows[0].value) : null;
+  check(doc && doc.name === 'AvtoServis' && doc.phone === '+998901234567'
+    && doc.address === 'Toshkent' && doc.social === 'https://instagram.com/x',
+    'P12.5 legacy row stored under settings.key = site', JSON.stringify(doc));
+  check(doc && doc.telegram === 'https://t.me/avtoservis' && doc.logo === 'logo.png' && doc.favicon === 'fav.png',
+    'P12.6 every legacy column is carried over, including ones the code never reads', JSON.stringify(doc));
+
+  const cols = await db.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'settings' ORDER BY column_name`);
+  check(cols.rows.map((r) => r.column_name).join(',') === 'key,value',
+    'P12.7 settings now has exactly key/value', cols.rows.map((r) => r.column_name).join(','));
+
+  const legacyTable = await db.query(
+    `SELECT name, phone FROM settings_legacy`);
+  check(legacyTable.rows.length === 1 && legacyTable.rows[0].name === 'AvtoServis',
+    'P12.8 the original table is preserved as settings_legacy', JSON.stringify(legacyTable.rows));
+
+  const versions = await db.query('SELECT version FROM schema_migrations ORDER BY version');
+  check(versions.rows.map((r) => r.version).join(',') === '001_init.sql,002_settings_key_value.sql',
+    'P12.9 both migrations recorded in schema_migrations', versions.rows.map((r) => r.version).join(','));
+
+  for (let i = 0; i < 2; i++) {
+    const again = await migrateLegacyDb();
+    check(again.code === 0 && again.out.includes('already up to date'),
+      `P12.${10 + i} re-run ${i + 1} is a no-op`, again.out.split('\n').filter((l) => /migrate/.test(l)).join(' | ').slice(0, 200));
+  }
+  const counts = await db.query(
+    `SELECT (SELECT count(*)::int FROM settings) s, (SELECT count(*)::int FROM settings_legacy) l,
+            (SELECT count(*)::int FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name LIKE 'settings%') t`);
+  check(counts.rows[0].s === 1 && counts.rows[0].l === 1 && counts.rows[0].t === 2,
+    'P12.12 re-runs neither duplicate rows nor create extra backup tables', JSON.stringify(counts.rows[0]));
+
+  // Several Vercel cold starts hit the database at the same time.
+  const racers = await Promise.all(Array.from({ length: 5 }, () => migrateLegacyDb()));
+  check(racers.every((r) => r.code === 0), 'P12.13 five concurrent migrations all succeed',
+    racers.map((r) => r.code).join(','));
+  const afterRace = await db.query(
+    `SELECT (SELECT count(*)::int FROM settings) s,
+            (SELECT count(*)::int FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name LIKE 'settings%') t`);
+  check(afterRace.rows[0].s === 1 && afterRace.rows[0].t === 2,
+    'P12.14 concurrent migrations do not duplicate the converted data', JSON.stringify(afterRace.rows[0]));
+
+  // Concurrent seeds must not duplicate the default catalogue. Admins can set
+  // arbitrary sort orders, so this is guarded by a lock and not a unique index.
+  await db.query('DELETE FROM services');
+  const seeds = await Promise.all(Array.from({ length: 5 }, () =>
+    new Promise((resolve) => {
+      const c = spawn(process.execPath, ['-e',
+        "const{seed,pool}=require('./src/db');seed().then(()=>pool.end()).then(()=>process.exit(0)).catch(e=>{console.error(e.message);process.exit(1)})"],
+      {
+        env: serverEnv({ DATABASE_URL: `postgresql://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${PG_LEGACY_DB}` }),
+        cwd: SERVER_ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let err = '';
+      c.stderr.on('data', (d) => (err += d));
+      c.on('exit', (code) => resolve({ code, err: err.trim() }));
+    })));
+  check(seeds.every((s) => s.code === 0), 'P12.15 five concurrent seeds all succeed',
+    seeds.map((s) => `${s.code}${s.err ? ':' + s.err : ''}`).join(' | ').slice(0, 300));
+  const seeded = await db.query('SELECT count(*)::int c FROM services');
+  check(seeded.rows[0].c === 5, 'P12.16 five concurrent seeds insert the catalogue exactly once', `services=${seeded.rows[0].c}`);
+
+  // Duplicate sort orders are legal (admins set them), so seeding must not
+  // depend on a unique index over them.
+  await db.query("UPDATE services SET sort_order = 1");
+  const dupSeed = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ['-e',
+      "const{seed,pool}=require('./src/db');seed().then(()=>pool.end()).then(()=>process.exit(0)).catch(e=>{console.error(e.message);process.exit(1)})"],
+    {
+      env: serverEnv({ DATABASE_URL: `postgresql://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${PG_LEGACY_DB}` }),
+      cwd: SERVER_ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let err = '';
+    c.stderr.on('data', (d) => (err += d));
+    c.on('exit', (code) => resolve({ code, err: err.trim() }));
+  });
+  const dupRows = await db.query('SELECT count(*)::int c FROM services');
+  check(dupSeed.code === 0 && dupRows.rows[0].c === 5,
+    'P12.17 seeding tolerates pre-existing duplicate sort_order values', `${dupSeed.code} ${dupSeed.err}`);
+
+  // An applied migration never re-runs, so a table dropped afterwards is not
+  // silently recreated: the startup check has to name it instead.
+  await db.query('DROP TABLE settings');
+  const noRerun = await migrateLegacyDb();
+  const droppedCheck = await checkSchemaIn(PG_LEGACY_DB);
+  const droppedProblem = (() => { try { return JSON.parse(droppedCheck.out).problems.find((p) => p.table === 'settings'); } catch { return null; } })();
+  check(noRerun.code !== 0 && droppedProblem?.problem === 'table missing'
+    && noRerun.out.includes('table "settings" is missing'),
+    'P12.18 a settings table dropped after migration is reported by name, not ignored',
+    `${noRerun.code} ${noRerun.out.split('\n').filter((l) => /migrate/.test(l)).join(' | ').slice(0, 200)}`);
+
+  // When 002 has not run yet it must create the table itself: 001 is recorded as
+  // applied in this state, so it would never create it again.
+  await db.query("DELETE FROM schema_migrations WHERE version = '002_settings_key_value.sql'");
+  const recreate = await migrateLegacyDb();
+  const rebuilt = await checkSchemaIn(PG_LEGACY_DB);
+  check(recreate.code === 0 && rebuilt.out.includes('"ok":true'),
+    'P12.19 002 creates the settings table when it is missing and has not run before', `${recreate.code} ${rebuilt.out.slice(0, 160)}`);
+
+  await db.end();
 }
 
 try {

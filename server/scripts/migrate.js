@@ -12,7 +12,15 @@ async function main() {
   const applied = await migrate();
   const status = await checkSchema();
   if (!status.ok) {
-    console.error(`[migrate] schema incomplete: ${status.missing} table(s) missing`);
+    // Naming the table and the columns turns a cryptic runtime failure into
+    // something the operator can act on directly.
+    for (const p of status.problems) {
+      if (p.problem === 'table missing') {
+        console.error(`[migrate] table "${p.table}" is missing`);
+      } else {
+        console.error(`[migrate] table "${p.table}" is missing column(s): ${p.missing.join(', ')}`);
+      }
+    }
     process.exitCode = 1;
     return;
   }
