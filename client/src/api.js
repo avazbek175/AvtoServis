@@ -29,7 +29,9 @@ async function request(path, options = {}) {
 
 export const api = {
   get: (p) => request(p),
-  post: (p, body) => request(p, { method: 'POST', body }),
+  // `headers` is for the rare per-request header that is not the session cookie,
+  // e.g. the one-time setup secret on POST /auth/setup.
+  post: (p, body, headers) => request(p, { method: 'POST', body, headers }),
   put: (p, body) => request(p, { method: 'PUT', body }),
   patch: (p, body) => request(p, { method: 'PATCH', body }),
   del: (p) => request(p, { method: 'DELETE' }),

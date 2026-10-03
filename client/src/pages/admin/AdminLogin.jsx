@@ -21,6 +21,7 @@ export default function AdminLogin() {
     su_username: '',
     su_email: '',
     su_password: '',
+    su_secret: '',
     app_name: '',
     app_phone: '',
     app_email: '',
@@ -46,12 +47,26 @@ export default function AdminLogin() {
     setBusy(true);
     try {
       if (needsSetup && mode === 'login') {
-        const r = await api.post('/auth/setup', {
-          full_name: form.su_name,
-          username: form.su_username,
-          email: form.su_email,
-          password: form.su_password,
-        });
+        // Captured into this closure and cleared from state immediately, so the
+        // secret exists only for the length of this request. It is deliberately
+        // not kept in localStorage/sessionStorage: a stored setup secret would
+        // survive on a shared machine and stay readable by any later script.
+        const setupSecret = form.su_secret;
+        setForm({ ...form, su_secret: '' });
+        const r = await api.post(
+          '/auth/setup',
+          {
+            full_name: form.su_name,
+            username: form.su_username,
+            email: form.su_email,
+            password: form.su_password,
+          },
+          // Sent in the Authorization header, which is what the endpoint expects
+          // and what the server's CORS allowlist already permits. Not sent at all
+          // when left blank, so a developer running without SETUP_SECRET set keeps
+          // the local bootstrap behaviour the backend grants in development.
+          setupSecret ? { Authorization: `Bearer ${setupSecret}` } : undefined
+        );
         setUser(r.user);
         navigate('/admin', { replace: true });
       } else if (mode === 'login') {
@@ -180,6 +195,21 @@ export default function AdminLogin() {
             <>
               <div className="rounded-xl border border-[rgb(var(--c-primary))]/25 bg-[rgb(var(--c-primary))]/10 px-4 py-3 text-xs text-white/70">
                 Tizim hali sozlanmagan. Bitta <b className="text-white">super admin</b> akkaunti yaratiladi — u barcha boshqaruv huquqiga ega bo'ladi.
+              </div>
+              <div>
+                <label className="label" htmlFor="su_secret">Setup secret</label>
+                <input
+                  id="su_secret"
+                  className="field"
+                  type="password"
+                  value={form.su_secret}
+                  onChange={set('su_secret')}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="mt-1 text-xs text-white/40">
+                  Serverdagi <code className="text-white/60">SETUP_SECRET</code> qiymatini kiriting. U faqat shu so'rov uchun yuboriladi, brauzerda saqlanmaydi va serverga o'tgach yo'q qilinadi. Productionda bo'lmasa so'rov 401 qaytaradi.
+                </p>
               </div>
               <div>
                 <label className="label" htmlFor="su_name">Ism va familiya *</label>
