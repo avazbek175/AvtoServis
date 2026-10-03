@@ -1,8 +1,21 @@
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('./pool');
+const { withAdvisoryXactLock } = require('./advisory');
 
 const MIGRATIONS_DIR = path.join(__dirname, '..', '..', 'migrations');
+
+/**
+ * Advisory lock key for migrations.
+ *
+ * Every Vercel instance migrates on cold start. Without a lock two of them read
+ * the same `schema_migrations` state, both decide a file is pending, and both
+ * apply it, which surfaces as `tuple concurrently updated`, duplicate rows, or a
+ * half-applied schema. Any stable 64-bit key works; it only has to be unique
+ * within this database. The lock itself is transaction-scoped -- see
+ * db/advisory.js for why a session lock must not be used with a pooled client.
+ */
+const MIGRATION_LOCK_ID = 728411905517;
 
 async function ensureMigrationsTable(client) {
   await client.query(`
@@ -18,6 +31,23 @@ async function appliedVersions(client) {
   return new Set(rows.map((r) => r.version));
 }
 
+/**
+ * Files that still need to run, read without any lock.
+ *
+ * This is the path every cold start takes once the schema is current, and it must
+ * stay lock-free: taking a lock just to discover there is nothing to do would make
+ * unrelated instances contend on every single boot.
+ *
+ * `to_regclass` is used instead of catching 42P01, so a first boot on an empty
+ * database does not log a `relation "schema_migrations" does not exist` error.
+ */
+async function pendingFiles(client, files) {
+  const { rows } = await client.query("SELECT to_regclass('schema_migrations') IS NOT NULL AS present");
+  if (!rows[0].present) return files;
+  const done = await appliedVersions(client);
+  return files.filter((f) => !done.has(f));
+}
+
 function migrationFiles() {
   if (!fs.existsSync(MIGRATIONS_DIR)) return [];
   return fs
@@ -29,78 +59,77 @@ function migrationFiles() {
 /**
  * Applies every migration that has not run yet.
  *
- * Each file runs in its own transaction together with the bookkeeping row, so a
- * failure leaves the schema exactly as it was and re-running is safe. Files are
- * applied in filename order and never re-applied.
- */
-/**
- * Advisory lock key for migrations.
+ * Each file is applied in its own transaction together with its bookkeeping row,
+ * so a failure leaves the schema exactly as it was and re-running is safe. The
+ * serialization lock is transaction-scoped and taken inside that same
+ * transaction, which means PostgreSQL releases it on COMMIT or ROLLBACK.
  *
- * Every Vercel instance runs the migration on cold start. Without a lock two
- * instances read the same `schema_migrations` state, both decide a file is
- * pending, and both try to apply it. That surfaces as `tuple concurrently
- * updated`, duplicate-key errors on `schema_migrations`, or a half-applied
- * schema. Any arbitrary but stable 64-bit key works; the value only has to be
- * unique within this database.
+ * Concurrent instances re-check `schema_migrations` under the lock, so a file is
+ * applied once no matter how many instances boot at the same moment.
  */
-const MIGRATION_LOCK_ID = 728411905517;
-
 async function migrate({ log = console.log } = {}) {
   const client = await pool.connect();
   const applied = [];
-  // Held for the whole run and released when the client is returned to the
-  // pool, so a crashed migration cannot leave the lock stuck.
-  let locked = false;
   try {
-    // Wait rather than fail: the winner finishes in seconds, and a losing
-    // instance must still end up on a migrated schema.
-    await client.query('SELECT pg_advisory_lock($1)', [String(MIGRATION_LOCK_ID)]);
-    locked = true;
-
-    // app_now() must exist before schema_migrations uses it as a default.
-    await client.query(`
-      CREATE OR REPLACE FUNCTION app_now() RETURNS text
-        LANGUAGE sql VOLATILE AS $$
-          SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS');
-        $$;
-    `);
-
     const files = migrationFiles();
     if (!files.length) {
       log('[migrate] no migration files found');
       return [];
     }
 
-    await client.query('BEGIN');
-    await ensureMigrationsTable(client);
-    await client.query('COMMIT');
+    const pending = await pendingFiles(client, files);
+    if (!pending.length) {
+      log(`[migrate] already up to date (${files.length} files)`);
+      return [];
+    }
 
-    const done = await appliedVersions(client);
-    for (const file of files) {
-      if (done.has(file)) continue;
+    for (const file of pending) {
       const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
-      await client.query('BEGIN');
-      try {
-        await client.query(sql);
-        // ON CONFLICT keeps a re-run from failing if the bookkeeping row was
-        // written by an earlier attempt whose transaction later aborted.
-        await client.query('INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING', [file]);
-        await client.query('COMMIT');
+      const didApply = await withAdvisoryXactLock(
+        client,
+        MIGRATION_LOCK_ID,
+        async () => {
+          // app_now() must exist before schema_migrations uses it as a default.
+          // It is created under the lock: concurrent `CREATE OR REPLACE FUNCTION`
+          // on the same function is not safe (it fails with XX000/23505), and
+          // instances only reach this point when they have work to do.
+          await client.query(`
+            CREATE OR REPLACE FUNCTION app_now() RETURNS text
+              LANGUAGE sql VOLATILE AS $$
+                SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS');
+              $$;
+          `);
+          await ensureMigrationsTable(client);
+          // Re-read under the lock: a concurrent instance may have just applied
+          // this file while we were waiting for it.
+          if ((await appliedVersions(client)).has(file)) return false;
+          await client.query(sql);
+          // ON CONFLICT keeps a re-run from failing if the bookkeeping row was
+          // written by an earlier attempt whose transaction later aborted.
+          await client.query(
+            'INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING',
+            [file]
+          );
+          return true;
+        },
+        { name: 'migration' }
+      ).catch((err) => {
+        // Keep `code` so withDbRetry() can still tell a transient database
+        // failure from a genuine SQL error.
+        const wrapped = new Error(`[migrate] ${file} failed: ${err.message}`);
+        if (err.code) wrapped.code = err.code;
+        throw wrapped;
+      });
+
+      if (didApply) {
         applied.push(file);
         log(`[migrate] applied ${file}`);
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw new Error(`[migrate] ${file} failed: ${err.message}`);
       }
     }
 
-    if (!applied.length) log(`[migrate] already up to date (${files.length} files)`);
     return applied;
   } finally {
-    if (locked) {
-      // Best effort: the lock is also released when the connection closes.
-      await client.query('SELECT pg_advisory_unlock($1)', [String(MIGRATION_LOCK_ID)]).catch(() => {});
-    }
+    // Nothing is held across this point: the lock died with its transaction.
     client.release();
   }
 }
@@ -164,4 +193,4 @@ async function checkSchema() {
   }
 }
 
-module.exports = { migrate, checkSchema, MIGRATIONS_DIR, EXPECTED_COLUMNS };
+module.exports = { migrate, checkSchema, MIGRATIONS_DIR, EXPECTED_COLUMNS, MIGRATION_LOCK_ID };

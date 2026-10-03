@@ -1,4 +1,5 @@
 const { pool, query, transaction, statement, toPgPlaceholders } = require('./pool');
+const { withAdvisoryXactLock } = require('./advisory');
 
 const { DEFAULT_SETTINGS, DEFAULT_MASTER_PERMISSIONS } = require('./defaults');
 
@@ -73,57 +74,70 @@ const db = {
  *
  * Distinct from the migration lock so a cold start never nests the two, and so
  * seeding stays serialised even though migrations release their lock first.
+ *
+ * Transaction-scoped, like the migration lock: a session lock would stay attached
+ * to the pooled connection after `seed()` returned. See db/advisory.js.
  */
 const SEED_LOCK_ID = 728411905518;
 
 /**
  * Inserts the default settings and the default service catalogue.
  *
- * Safe on every cold start and safe to call concurrently: the lock makes the
- * check-then-insert below atomic per database, and the settings upsert is
- * idempotent by primary key.
+ * Safe on every cold start and safe to call concurrently: the transaction-scoped
+ * lock makes the check-then-insert below atomic per database, and the settings
+ * upsert is idempotent by primary key.
  *
  * The lock is preferred over a unique index on `services(sort_order)` because
  * admins can set arbitrary sort orders, so existing production data may already
  * contain duplicates. Creating a unique index over that data would fail and
  * block startup, whereas a lock never touches existing rows.
+ *
+ * Losing the race is not an error: another instance is seeding the same
+ * idempotent defaults. The service catalogue is then filled on a later cold
+ * start, and `/api/public/settings` already falls back to the defaults, so this
+ * instance can serve requests either way.
  */
 async function seed() {
   const client = await pool.connect();
-  let locked = false;
   try {
-    await client.query('SELECT pg_advisory_lock($1)', [String(SEED_LOCK_ID)]);
-    locked = true;
+    await withAdvisoryXactLock(
+      client,
+      SEED_LOCK_ID,
+      async () => {
+        for (const key of Object.keys(DEFAULT_SETTINGS)) {
+          await client.query(
+            toPgPlaceholders('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING'),
+            [key, JSON.stringify(DEFAULT_SETTINGS[key])]
+          );
+        }
 
-    for (const key of Object.keys(DEFAULT_SETTINGS)) {
-      await client.query(
-        toPgPlaceholders('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING'),
-        [key, JSON.stringify(DEFAULT_SETTINGS[key])]
-      );
-    }
-
-    const { rows } = await client.query('SELECT COUNT(*) AS c FROM services');
-    if (Number(rows[0].c) === 0) {
-      const services = [
-        ['Mator xodovoy', 'Dvigatel va xodovoy qismlarni ta\'mirlash bo\'yicha to\'liq xizmat: kapital va joriy ta\'mirlash, moy va filtrlarni almashtirish.', 'Sifatli ehtiyot qismlar|Kafolatli ta\'mirlash|Tajribali ustalar', '', 'engine', '', 1],
-        ['Diagnostika', 'Komputer diagnostikasi yordamida avtomobilingizning barcha tizimlarini tekshiramiz.', 'Xatolarni aniq aniqlash|Tezkor natija|Sizga qulay vaqt', '', 'diagnostic', '', 2],
-        ['Programma', 'Avtomobil tizimlarini sozlash, chip tuning va dasturiy ta\'minotni yangilash xizmatlari.', 'Quvvat oshishi|Yoqilgan\'i tejalishi|Tizim barqarorligi', '', 'chip', '', 3],
-        ['Elektrik', 'Avtomobil elektr qismlarini diagnostika qilish va ta\'mirlash: starter, generator, simlar.', 'Zamonaviy uskunalar|Aniq sababni topish|Ishonchli ta\'mirlash', '', 'bolt', '', 4],
-        ['Moy almashtirish', 'Dvigatel moyi va filtrlarni tez va sifatli almashtirish. Barcha turdagi moylar.', 'Moy turini tanlashda yordam|Tez xizmat|Toza ish joyi', '', 'oil', '', 5],
-      ];
-      for (const s of services) {
-        await client.query(
-          toPgPlaceholders(
-            'INSERT INTO services (name, description, benefits, image, icon, price, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
-          ),
-          s
-        );
-      }
-    }
+        const { rows } = await client.query('SELECT COUNT(*) AS c FROM services');
+        if (Number(rows[0].c) === 0) {
+          const services = [
+            ['Mator xodovoy', 'Dvigatel va xodovoy qismlarni ta\'mirlash bo\'yicha to\'liq xizmat: kapital va joriy ta\'mirlash, moy va filtrlarni almashtirish.', 'Sifatli ehtiyot qismlar|Kafolatli ta\'mirlash|Tajribali ustalar', '', 'engine', '', 1],
+            ['Diagnostika', 'Komputer diagnostikasi yordamida avtomobilingizning barcha tizimlarini tekshiramiz.', 'Xatolarni aniq aniqlash|Tezkor natija|Sizga qulay vaqt', '', 'diagnostic', '', 2],
+            ['Programma', 'Avtomobil tizimlarini sozlash, chip tuning va dasturiy ta\'minotni yangilash xizmatlari.', 'Quvvat oshishi|Yoqilgan\'i tejalishi|Tizim barqarorligi', '', 'chip', '', 3],
+            ['Elektrik', 'Avtomobil elektr qismlarini diagnostika qilish va ta\'mirlash: starter, generator, simlar.', 'Zamonaviy uskunalar|Aniq sababni topish|Ishonchli ta\'mirlash', '', 'bolt', '', 4],
+            ['Moy almashtirish', 'Dvigatel moyi va filtrlarni tez va sifatli almashtirish. Barcha turdagi moylar.', 'Moy turini tanlashda yordam|Tez xizmat|Toza ish joyi', '', 'oil', '', 5],
+          ];
+          for (const s of services) {
+            await client.query(
+              toPgPlaceholders(
+                'INSERT INTO services (name, description, benefits, image, icon, price, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
+              ),
+              s
+            );
+          }
+        }
+      },
+      { name: 'seed' }
+    );
+  } catch (err) {
+    // Only a lost race is tolerated; anything else (missing table, bad SQL) must
+    // still fail startup loudly.
+    if (err.code !== 'LOCK_BUSY') throw err;
+    console.error('[db] seed skipped: ' + err.message);
   } finally {
-    if (locked) {
-      await client.query('SELECT pg_advisory_unlock($1)', [String(SEED_LOCK_ID)]).catch(() => {});
-    }
     client.release();
   }
 }
@@ -133,4 +147,4 @@ async function resetSettings() {
   await seed();
 }
 
-module.exports = { db, counter, pool, query, transaction, prepare, DEFAULT_SETTINGS, DEFAULT_MASTER_PERMISSIONS, seed, resetSettings };
+module.exports = { db, counter, pool, query, transaction, prepare, DEFAULT_SETTINGS, DEFAULT_MASTER_PERMISSIONS, seed, resetSettings, SEED_LOCK_ID };

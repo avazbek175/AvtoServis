@@ -35,6 +35,9 @@ const PG_LATE_DB = 'avtoservis_late_test';
 // Its own legacy database for the HTTP-level check: PG_LEGACY_DB is left in a
 // deliberately rebuilt state at the end of the group above.
 const PG_LEGACY_HTTP_DB = 'avtoservis_legacy_http_test';
+// Dedicated database for the advisory-lock concurrency tests, which need to hold
+// and release locks from separate sessions while a migration is pending.
+const PG_LOCK_DB = 'avtoservis_lock_test';
 const PG_USER = 'avtoservis';
 const PG_PASSWORD = 'avtoservis_test_pw';
 const PORT = Number(process.env.TEST_PORT || 4321);
@@ -988,6 +991,9 @@ async function securityTests(ctx) {
 
   // ================================================ P13. startup readiness
   await readinessTests();
+
+  // ================================================== P15. advisory locks
+  await advisoryLockTests();
 }
 
 /** Runs the real migration CLI against the legacy database. */
@@ -1027,6 +1033,219 @@ function legacyClient(db = PG_LEGACY_DB) {
   return new pgDriver.Client({
     host: '127.0.0.1', port: PG_PORT, user: PG_USER, password: PG_PASSWORD, database: db,
   });
+}
+
+/**
+ * Advisory-lock serialization on cold start.
+ *
+ * Production shape: every Vercel instance boots, runs `migrate()` and `seed()`
+ * against the same database through a node-postgres pool. Two problems were seen
+ * in production logs:
+ *
+ *   * `[db] startup failed during migrate: 57014 canceling statement due to
+ *     statement timeout` -- `pg_advisory_lock()` *blocks*, and the managed
+ *     database has a statement timeout, so ordinary overlap between two cold
+ *     starts surfaced as a cancellation instead of one instance waiting its turn.
+ *   * A session-level lock outlives the call that took it: `client.release()`
+ *     returns the *connection* to the pool, not to a fresh session, so a lock
+ *     left behind keeps blocking every other instance. Advisory locks are also
+ *     re-entrant per session, so the stale holder could re-take the lock
+ *     instantly and the lock stopped excluding anything.
+ *
+ * These tests hold the real lock from a separate session and count locks in
+ * `pg_locks`, so they fail against a session-level implementation and pass only
+ * if the lock is transaction-scoped.
+ */
+async function advisoryLockTests() {
+  group('P15. Advisory locks on cold start (pooled connections)');
+
+  // One shared client for direct assertions; every migrate/seed run happens in a
+  // child process, because those modules bind the pool to their own DATABASE_URL.
+  const db = legacyClient(PG_LOCK_DB);
+  const lockId = '728411905517';
+  const seedLockId = '728411905518';
+
+  const dbUrl = (db_) => `postgresql://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${db_}`;
+  // Managed PostgreSQL (Supabase and friends) sets a statement timeout, which is
+  // what turned lock contention into 57014 in production. Reproduce it locally.
+  const slowUrl = `${dbUrl(PG_LOCK_DB)}?options=-c%20statement_timeout%3D1200`;
+
+  const runIn = (script, extra = {}) => new Promise((resolve) => {
+    const c = spawn(process.execPath, ['-e', script], {
+      env: serverEnv({ DATABASE_URL: dbUrl(PG_LOCK_DB), ...extra }),
+      cwd: SERVER_ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    c.stdout.on('data', (d) => (out += d));
+    c.stderr.on('data', (d) => (out += d));
+    c.on('exit', (code) => resolve({ code, out: out.trim() }));
+  });
+
+  const MIGRATE = "const{migrate}=require('./src/db/migrate');const{pool}=require('./src/db/pool');"
+    + 'migrate({log:()=>{}}).then(a=>{console.log(JSON.stringify(a));return pool.end()})'
+    + '.catch(e=>{console.error(e.code+" "+e.message);process.exit(1)})';
+  const SEED = "const{seed}=require('./src/db');const{pool}=require('./src/db/pool');"
+    + 'seed().then(()=>{console.log("SEEDED");return pool.end()})'
+    + '.catch(e=>{console.error(e.code+" "+e.message);process.exit(1)})';
+
+  // Holds the lock in its own session for `holdMs`, then releases it.
+  const holdLock = (id, holdMs) => new Promise((resolve) => {
+    const c = spawn(process.execPath, ['-e',
+      `const{Client}=require('pg');(async()=>{const c=new Client({connectionString:process.env.DATABASE_URL});`
+      + `await c.connect();await c.query('SELECT pg_advisory_lock($1)',['${id}']);console.log('LOCKED');`
+      + `setTimeout(async()=>{await c.query('SELECT pg_advisory_unlock($1)',['${id}']);await c.end();process.exit(0)},${holdMs});`
+      + `})().catch(e=>{console.error(e.message);process.exit(1)})`], {
+      env: serverEnv({ DATABASE_URL: dbUrl(PG_LOCK_DB) }),
+      cwd: SERVER_ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    c.stdout.on('data', (d) => { out += d; if (out.includes('LOCKED')) resolve({ proc: c, ready: true }); });
+    c.stderr.on('data', (d) => (out += d));
+    c.on('exit', () => resolve({ proc: c, ready: out.includes('LOCKED') }));
+  });
+
+  const advisoryLockCount = async () => {
+    const { rows } = await db.query(
+      "SELECT count(*)::int c FROM pg_locks WHERE locktype = 'advisory'"
+    );
+    return Number(rows[0].c);
+  };
+  // A 64-bit advisory key is stored as classid (high 32 bits) / objid (low 32),
+  // and both columns are `oid`, so the key has to be split before comparing.
+  const heldBy = async (id) => {
+    const key = BigInt(id);
+    const { rows } = await db.query(
+      "SELECT count(*)::int c FROM pg_locks WHERE locktype = 'advisory' AND classid = $1 AND objid = $2",
+      [Number(key >> 32n) >>> 0, Number(key & 0xffffffffn) >>> 0]
+    );
+    return Number(rows[0].c);
+  };
+
+  // ------------------------------------------------------ P15.0 fresh start
+  await pg.createDatabase(PG_LOCK_DB);
+  await db.connect();
+
+  const first = await runIn(MIGRATE);
+  check(first.code === 0 && first.out.includes('001_init.sql'),
+    'P15.0 fresh database migrates', first.out);
+
+  // ------------------------------- P15.1 contended migration waits, no timeout
+  // Pretend 002 is pending again. Re-running it is a no-op (the settings table is
+  // already key/value and 001 is all IF NOT EXISTS), so this stays non-destructive.
+  await db.query('DELETE FROM schema_migrations WHERE version = $1', ['002_settings_key_value.sql']);
+
+  const holder = await holdLock(lockId, 2200);
+  check(holder.ready, 'P15.1a another session can hold the migration lock');
+  const t0 = Date.now();
+  const contended = await runIn(MIGRATE, { DATABASE_URL: slowUrl });
+  const waited = Date.now() - t0;
+  check(contended.code === 0 && !contended.out.includes('57014'),
+    'P15.1b a migration blocked by the lock waits for its turn instead of timing out',
+    `exit=${contended.code} ${contended.out}`);
+  check(waited > 1000, 'P15.1c it really waited rather than skipping the lock',
+    `${waited}ms`);
+  check(await advisoryLockCount() === 0, 'P15.1d no advisory lock left behind after migrate',
+    `count=${await advisoryLockCount()}`);
+
+  // ----------------------------------- P15.2 up-to-date start must not lock
+  const holder2 = await holdLock(lockId, 5000);
+  check(holder2.ready, 'P15.2a lock is held by another session');
+  const t1 = Date.now();
+  const fast = await runIn(MIGRATE, { DATABASE_URL: slowUrl });
+  const fastMs = Date.now() - t1;
+  check(fast.code === 0 && fast.out === '[]', 'P15.2b nothing pending returns immediately',
+    `exit=${fast.code} ${fast.out}`);
+  check(fastMs < 1000,
+    'P15.2c an already-migrated database does not block on the lock at all',
+    `${fastMs}ms`);
+  holder2.proc.kill('SIGKILL');
+
+  // ------------------------------- P15.3 concurrent cold starts, same database
+  await db.query('DELETE FROM schema_migrations WHERE version = $1', ['002_settings_key_value.sql']);
+  const racers = await Promise.all(Array.from({ length: 5 }, () =>
+    runIn(MIGRATE, { DATABASE_URL: slowUrl })));
+  check(racers.every((x) => x.code === 0),
+    'P15.3a five concurrent startups all succeed', racers.map((x) => x.code).join(','));
+  check(!racers.some((x) => x.out.includes('57014')),
+    'P15.3b none of them hit a statement timeout',
+    racers.find((x) => x.out.includes('57014'))?.out);
+  const { rows: dup } = await db.query(
+    'SELECT version, count(*)::int c FROM schema_migrations GROUP BY version HAVING count(*) > 1');
+  check(dup.length === 0, 'P15.3c each migration is recorded exactly once',
+    JSON.stringify(dup));
+  check(await advisoryLockCount() === 0, 'P15.3d no advisory lock left behind after the race',
+    `count=${await advisoryLockCount()}`);
+
+  // ------------------------------- P15.4 a failure must not strand the lock
+  // Runs the lock helper and throws inside it; the rollback has to release it.
+  const failing = await runIn(
+    "const{withAdvisoryXactLock}=require('./src/db/advisory');const{pool}=require('./src/db/pool');"
+    + `withAdvisoryXactLock(pool,${lockId},async()=>{await pool.query('SELECT 1');throw new Error('boom')},`
+    + "{waitMs:2000,name:'test'})"
+    + '.then(()=>{console.error("no throw");process.exit(1)})'
+    + ".catch(e=>{console.error(e.message);return pool.end()})",
+    { DATABASE_URL: slowUrl });
+  check(failing.code === 0 && failing.out.includes('boom'),
+    'P15.4a the failing operation reports its own error', `exit=${failing.code} ${failing.out}`);
+  check(await heldBy(lockId) === 0,
+    'P15.4b the lock is released after a failure, so the next cold start is not blocked',
+    `count=${await heldBy(lockId)}`);
+
+  const afterFailure = await runIn(MIGRATE, { DATABASE_URL: slowUrl });
+  check(afterFailure.code === 0,
+    'P15.4c a migration still runs after an earlier attempt failed', afterFailure.out);
+
+  // ------------------------------------------ P15.5 seed uses the same safety
+  await db.query('DELETE FROM settings');
+  await db.query('DELETE FROM services');
+  const seeders = await Promise.all(Array.from({ length: 4 }, () =>
+    runIn(SEED, { DATABASE_URL: slowUrl })));
+  check(seeders.every((x) => x.code === 0),
+    'P15.5a concurrent seeding all succeed', seeders.map((x) => x.code).join(','));
+  check(!seeders.some((x) => x.out.includes('57014')),
+    'P15.5b seeding never hits a statement timeout');
+  const { rows: svc } = await db.query('SELECT count(*)::int c FROM services');
+  check(svc.length === 1 && Number(svc[0].c) === 5,
+    'P15.5c services are seeded exactly once', JSON.stringify(svc));
+  const { rows: set } = await db.query('SELECT count(*)::int c FROM settings');
+  check(set.length === 1 && Number(set[0].c) > 0,
+    'P15.5d default settings are present once', JSON.stringify(set));
+  check(await advisoryLockCount() === 0,
+    'P15.5e no advisory lock left behind after seeding',
+    `count=${await advisoryLockCount()}`);
+
+  // Losing the seed race is tolerated (another instance is seeding the same
+  // idempotent defaults) rather than failing the cold start.
+  const seedHolder = await holdLock(seedLockId, 3000);
+  check(seedHolder.ready, 'P15.6a another session can hold the seed lock');
+  const t2 = Date.now();
+  const seedBlocked = await runIn(SEED, { DATABASE_URL: slowUrl, DB_LOCK_WAIT_MS: '1500' });
+  check(seedBlocked.code === 0 && Date.now() - t2 < 4000,
+    'P15.6b a seed blocked by the lock waits, then gives up without failing startup',
+    `exit=${seedBlocked.code} ${seedBlocked.out}`);
+  seedHolder.proc.kill('SIGKILL');
+
+  // -------------------------------- P15.7 schema checks must stay strict
+  const good = await checkSchemaIn(PG_LOCK_DB);
+  const goodJson = (() => { try { return JSON.parse(good.out); } catch { return null; } })();
+  check(good.code === 0 && goodJson && goodJson.ok === true && goodJson.problems.length === 0,
+    'P15.7a checkSchema still accepts the migrated schema', good.out);
+
+  // Rename a required column: checkSchema must notice. This keeps the fix honest
+  // -- an implementation that quietly stopped validating would fail here.
+  await db.query('ALTER TABLE services RENAME COLUMN price TO price_renamed_by_test');
+  const broken = await checkSchemaIn(PG_LOCK_DB);
+  const brokenJson = (() => { try { return JSON.parse(broken.out); } catch { return null; } })();
+  check(broken.code === 0 && brokenJson && brokenJson.ok === false
+    && brokenJson.problems.some((pr) => pr.table === 'services'
+      && pr.problem === 'columns missing' && pr.missing.includes('price')),
+    'P15.7b a missing required column is still reported', broken.out);
+  await db.query('ALTER TABLE services RENAME COLUMN price_renamed_by_test TO price');
+  const restored = await checkSchemaIn(PG_LOCK_DB);
+  check(restored.code === 0 && restored.out.includes('"ok":true'),
+    'P15.7c schema validation recovers once the column is back', restored.out);
+
+  await db.end();
 }
 
 /**
