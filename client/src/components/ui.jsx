@@ -42,20 +42,50 @@ export function Alert({ kind = 'error', children, className = '' }) {
   );
 }
 
-export function Modal({ open, onClose, title, children, wide = false }) {
+/**
+ * Modal dialog.
+ *
+ * Two layouts, one component:
+ *
+ *   * Default (no `footer`): the whole panel scrolls, header included. Right for
+ *     the short forms and confirmations that dominate this app.
+ *   * With a `footer`: the panel becomes a flex column, the header stays pinned,
+ *     only the middle scrolls and the footer stays pinned at the bottom. This
+ *     exists because a form that grows (the multi-product add form holds up to 20
+ *     cards) would otherwise scroll its own Save button off the screen, leaving
+ *     the operator scrolling to hunt for it. It is opt-in, so no existing call
+ *     site changes layout.
+ */
+export function Modal({ open, onClose, title, children, wide = false, footer = null, bodyClassName = '' }) {
   if (!open) return null;
+  const shell = `relative w-full ${wide ? 'max-w-3xl' : 'max-w-lg'} max-h-[90vh] rounded-2xl border border-white/10 bg-[#111725] shadow-2xl animate-modal-in`;
+  const closeButton = (
+    <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-white/50 transition hover:bg-white/10 hover:text-white" aria-label="Yopish">
+      <Icon name="close" size={20} />
+    </button>
+  );
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm animate-fade-in" onClick={onClose} />
-      <div className={`relative w-full ${wide ? 'max-w-3xl' : 'max-w-lg'} max-h-[90vh] overflow-y-auto rounded-2xl border border-white/10 bg-[#111725] p-6 shadow-2xl animate-modal-in`}>
-        <div className="mb-5 flex items-center justify-between">
-          <h3 className="text-lg font-bold text-white">{title}</h3>
-          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-white/50 transition hover:bg-white/10 hover:text-white" aria-label="Yopish">
-            <Icon name="close" size={20} />
-          </button>
+      {footer ? (
+        <div className={`${shell} flex flex-col overflow-hidden`}>
+          <div className="flex shrink-0 items-center justify-between border-b border-white/10 px-6 py-4">
+            <h3 className="text-lg font-bold text-white">{title}</h3>
+            {closeButton}
+          </div>
+          <div className={`min-h-0 flex-1 overflow-y-auto px-6 py-5 ${bodyClassName}`}>{children}</div>
+          <div className="shrink-0 border-t border-white/10 bg-[#0e1420] px-6 py-4">{footer}</div>
         </div>
-        {children}
-      </div>
+      ) : (
+        <div className={`${shell} overflow-y-auto p-6`}>
+          <div className="mb-5 flex items-center justify-between">
+            <h3 className="text-lg font-bold text-white">{title}</h3>
+            {closeButton}
+          </div>
+          {children}
+        </div>
+      )}
     </div>
   );
 }

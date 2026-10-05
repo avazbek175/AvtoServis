@@ -402,63 +402,81 @@ router.get('/products/:id', async (req, res) => {
 });
 
 router.post('/products', async (req, res) => {
-  const body = req.body || {};
-  const clean = inv.validateProduct(body);
-  const opening = body.current_quantity === undefined || body.current_quantity === null || body.current_quantity === ''
-    ? 0
-    : inv.parseQty(body.current_quantity, "Boshlang'ich qoldiq", { allowZero: true });
+  const product = await db.transaction((t) => inv.createProduct(t, req, req.body || {}));
+  const { opening_movement_id, ...created } = product;
+  res.status(201).json({
+    product: { ...created, state: stockState(created), state_label: STATE_UZ[stockState(created)] },
+  });
+});
 
-  const product = await db.transaction(async (t) => {
-    const created = await t
-      .prepare(
-        `INSERT INTO inventory_products
-           (name, type, brand, viscosity, unit, package_size, current_quantity,
-            minimum_quantity, cost_price, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-         RETURNING ${inv.PRODUCT_FIELDS}`
-      )
-      .one(
-        clean.name,
-        clean.type,
-        clean.brand,
-        clean.viscosity,
-        clean.unit,
-        clean.package_size,
-        0,
-        clean.minimum_quantity,
-        clean.cost_price
-      );
+/**
+ * Bulk product creation: one request, one transaction, all products or none.
+ *
+ * Stocking a warehouse is normally done as a batch -- the supplier hands over
+ * eight SKUs, not one -- so the single-create path was being used as an
+ * eight-request loop from the UI. That loop has two failure modes a single
+ * request does not: a rejected product in the middle leaves the earlier ones
+ * saved (the operator then has to work out which half arrived), and the browser
+ * can fire the requests concurrently, so two of them can race on the same
+ * stock figures.
+ *
+ * Here every product is validated, inserted, given its opening movement and
+ * audited inside ONE transaction. The first invalid product throws, which rolls
+ * back the products already inserted in the same transaction, so a partial batch
+ * cannot exist: either all of them are in the warehouse or none of them are.
+ *
+ * Duplicates are deliberately allowed. `inventory_products` has no unique
+ * constraint on the name, and adding one would be a behaviour change the existing
+ * data cannot satisfy -- the same brand and viscosity can legitimately be stocked
+ * from two suppliers at different package sizes. So a repeated product in one
+ * batch is saved twice, exactly as two separate single-create calls would.
+ *
+ * Declared before the "/products/:id/..." patterns, and those patterns do not
+ * collide with it anyway ("/products/bulk" is two segments, "/products/:id/..." is
+ * three), so the literal path is unambiguous.
+ */
+router.post('/products/bulk', async (req, res) => {
+  const items = (req.body || {}).products;
+  if (!Array.isArray(items)) {
+    throw inv.badRequest("'products' massivi talab qilinadi");
+  }
+  if (items.length === 0) {
+    throw inv.badRequest('Kamida bitta mahsulot kiritilishi kerak');
+  }
+  if (items.length > inv.MAX_BULK_PRODUCTS) {
+    throw inv.badRequest(
+      `Bir vaqtda ko'pi bilan ${inv.MAX_BULK_PRODUCTS} ta mahsulot qo'shish mumkin (hozir: ${items.length})`
+    );
+  }
 
-    // An opening stock is a purchase, not a magic number: without this the very
-    // first movement ledger would already disagree with current_quantity and the
-    // reconciliation would report a permanent discrepancy.
-    if (opening > 0) {
-      const movement = await t
-        .prepare(
-          `INSERT INTO inventory_movements
-             (product_id, movement_type, quantity, before_quantity, after_quantity,
-              reference_type, reference_id, admin_id, note)
-           VALUES (?, 'purchase', ?, 0, ?, NULL, NULL, ?, ?)
-           RETURNING id`
-        )
-        .one(created.id, opening, opening, req.user.id, "Boshlang'ich qoldiq");
-      await t
-        .prepare('UPDATE inventory_products SET current_quantity = ? WHERE id = ?')
-        .run(opening, created.id);
-      created.current_quantity = opening;
-      created.opening_movement_id = movement.id;
+  const created = await db.transaction(async (t) => {
+    const rows = [];
+    for (let i = 0; i < items.length; i++) {
+      try {
+        rows.push(
+          await inv.createProduct(t, req, items[i], {
+            auditExtra: { batch_size: items.length, batch_position: i + 1 },
+          })
+        );
+      } catch (err) {
+        // Re-thrown with the position of the offending card. The operator has to
+        // know WHICH of the eight cards was wrong; "Viskozitet majburiy" on its
+        // own would send them looking through all eight. The original status is
+        // preserved so a conflict or a missing row never silently degrades to 400.
+        const wrapped = new Error(`${i + 1}-mahsulot: ${err.message}`);
+        wrapped.status = err.status || 400;
+        throw wrapped;
+      }
     }
-
-    await inv.audit(t, req, created.id, 'created', {
-      ...inv.snapshot(created),
-      opening_quantity: opening,
-    });
-    return created;
+    return rows;
   });
 
-  delete product.opening_movement_id;
   res.status(201).json({
-    product: { ...product, state: stockState(product), state_label: STATE_UZ[stockState(product)] },
+    count: created.length,
+    products: created.map((row) => {
+      const { opening_movement_id, ...product } = row;
+      return { ...product, state: stockState(product), state_label: STATE_UZ[stockState(product)] };
+    }),
   });
 });
 

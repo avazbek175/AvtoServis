@@ -466,6 +466,116 @@ function appNow() {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 }
 
+/**
+ * Upper bound on one bulk product request.
+ *
+ * The cap is not cosmetic. Each product in a bulk batch is validated, inserted,
+ * given its opening movement and audited inside a single transaction that holds
+ * one pooled connection; an unbounded batch could therefore hold a connection
+ * long enough to starve the rest of the app. It also keeps the modal usable --
+ * past a couple of dozen cards the form is a wall of inputs, not a form.
+ */
+const MAX_BULK_PRODUCTS = 20;
+
+/**
+ * Reads the opening stock out of a product payload.
+ *
+ * Two names mean the same thing and are normalised here rather than at each call
+ * site: `initial_quantity` is what the bulk form sends (it says plainly that this
+ * is the stock the product *starts* with), `current_quantity` is the historical
+ * single-create field. They are never two independent quantities.
+ *
+ * A filter's opening stock must be a whole number, because half a filter is not
+ * something that can later be consumed either -- the consumption endpoint already
+ * refuses a fractional filter, and seeding one here would create stock that can
+ * never be used.
+ */
+function parseOpening(input, type) {
+  const raw =
+    input.initial_quantity !== undefined && input.initial_quantity !== null && input.initial_quantity !== ''
+      ? input.initial_quantity
+      : input.current_quantity;
+  if (raw === undefined || raw === null || raw === '') return 0;
+  return parseQty(raw, "Boshlang'ich qoldiq", {
+    allowZero: true,
+    integer: type === 'filter',
+  });
+}
+
+/**
+ * Creates one product with its opening stock movement and its audit rows.
+ *
+ * MUST be called inside db.transaction(): the product row, the movement that
+ * justifies its stock level and the audit trail have to become visible together
+ * or not at all. Everything before the movement is optional (a product may start
+ * empty), but a product with stock and no movement row would make the very first
+ * reconciliation report a permanent discrepancy.
+ *
+ * The single-create endpoint and the bulk endpoint both call this, so the two
+ * paths cannot drift apart: a validation rule or a ledger fix applied here lands
+ * in both at once.
+ *
+ * @param {object} runner transaction scope -- never the pool
+ * @param {object} input  one product payload
+ * @param {object} [opts] `{ auditExtra }` merged into the `created` audit row
+ * @returns {Promise<object>} the created product, plus `opening_movement_id`
+ *   when stock was seeded.
+ */
+async function createProduct(runner, req, input, opts = {}) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const clean = validateProduct(source);
+  const opening = parseOpening(source, clean.type);
+
+  const created = await runner
+    .prepare(
+      `INSERT INTO inventory_products
+         (name, type, brand, viscosity, unit, package_size, current_quantity,
+          minimum_quantity, cost_price, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+       RETURNING ${PRODUCT_FIELDS}`
+    )
+    .one(
+      clean.name,
+      clean.type,
+      clean.brand,
+      clean.viscosity,
+      clean.unit,
+      clean.package_size,
+      0,
+      clean.minimum_quantity,
+      clean.cost_price
+    );
+
+  let openingMovementId = null;
+  if (opening > 0) {
+    const movement = await runner
+      .prepare(
+        `INSERT INTO inventory_movements
+           (product_id, movement_type, quantity, before_quantity, after_quantity,
+            reference_type, reference_id, admin_id, note)
+         VALUES (?, 'purchase', ?, 0, ?, NULL, NULL, ?, ?)
+         RETURNING id`
+      )
+      .one(created.id, opening, opening, req.user.id, "Boshlang'ich qoldiq");
+    await runner
+      .prepare('UPDATE inventory_products SET current_quantity = ? WHERE id = ?')
+      .run(opening, created.id);
+    created.current_quantity = opening;
+    openingMovementId = movement.id;
+  }
+
+  await audit(runner, req, created.id, 'created', {
+    ...snapshot(created),
+    opening_quantity: opening,
+    // The audit `action` column is a fixed CHECK enum, so a batch is recorded by
+    // annotating each member rather than by inventing a new action that would
+    // require a migration.
+    ...(opts.auditExtra || {}),
+  });
+
+  return openingMovementId ? { ...created, opening_movement_id: openingMovementId } : created;
+}
+
 module.exports = {
   PRODUCT_FIELDS,
   MOVEMENT_FIELDS,
@@ -473,6 +583,7 @@ module.exports = {
   MOVEMENT_TYPES,
   PRODUCT_TYPES,
   UNITS,
+  MAX_BULK_PRODUCTS,
   unitForType,
   unitLabel,
   badRequest,
@@ -485,6 +596,8 @@ module.exports = {
   parseMoney,
   text,
   validateProduct,
+  parseOpening,
+  createProduct,
   audit,
   auditStandalone,
   snapshot,

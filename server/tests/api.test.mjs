@@ -15,6 +15,26 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import EmbeddedPostgres from 'embedded-postgres';
 import pgDriver from 'pg';
+// The batch form's card-list rules live in a JSX-free module precisely so they can be
+// asserted here without a browser. This is client code imported into a server test on
+// purpose: "remove the middle card and the numbering is right" is a real requirement
+// of the feature, and this is the only place it can be checked.
+import {
+  MAX_PRODUCTS as CLIENT_MAX_PRODUCTS,
+  addDraft as addClientDraft,
+  canAdd as canClientAdd,
+  canRemove as canClientRemove,
+  clearFieldError,
+  draftPayload,
+  emptyDraft,
+  firstInvalidIndex,
+  focusFromServerMessage,
+  newDrafts as newClientDrafts,
+  removeDraft as removeClientDraft,
+  switchType,
+  updateDraft,
+  validateDrafts,
+} from '../../client/src/pages/admin/inventoryDrafts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_ROOT = path.join(__dirname, '..');
@@ -2478,6 +2498,409 @@ async function readinessTests() {
   check(r.status === 404, 'P17.17 a non-numeric id is a 404, not a 500', `status=${r.status}`);
   r = await isa.post('/api/admin/inventory/products/999999/stock-in', { quantity: 1 });
   check(r.status === 404, 'P17.9 a movement on a missing product is a 404', `status=${r.status}`);
+
+  // =========================================================================
+  // P18. Adding several products in one request
+  // =========================================================================
+  //
+  // These groups sit after P17 on purpose: P17 asserts exact counts and totals on
+  // the shared warehouse, so anything created here would move those numbers.
+
+  /** Counts rows matching a name, on a connection of our own rather than the API. */
+  const countNamed = async (name) => {
+    const c = legacyClient(PG_DB);
+    await c.connect();
+    const out = await c.query('SELECT COUNT(*)::int AS n FROM inventory_products WHERE name = $1', [name]);
+    await c.end();
+    return out.rows[0].n;
+  };
+
+  /** Reads one product's opening movement, to prove the ledger backs the stock. */
+  const openingMovements = async (productId) => {
+    const c = legacyClient(PG_DB);
+    await c.connect();
+    const out = await c.query(
+      "SELECT movement_type, quantity::float8 AS quantity, before_quantity::float8 AS before_quantity, after_quantity::float8 AS after_quantity, note FROM inventory_movements WHERE product_id = $1 ORDER BY id",
+      [productId]
+    );
+    await c.end();
+    return out.rows;
+  };
+
+  group('P18.0 The batch endpoint follows the warehouse rules');
+  // A literal path that is not a product id: if the router matched it as ":id" the
+  // request would answer 404, which is exactly the failure this guards against.
+  for (const [m, p] of [
+    ['POST', '/api/admin/inventory/products/bulk'],
+    ['GET', '/api/admin/inventory/products/bulk'],
+  ]) {
+    r = await anonI.req(m, p, m === 'POST' ? { products: [] } : undefined);
+    check(r.status === 401, `P18.0 unauthenticated ${m} ${p} is refused`, `status=${r.status}`);
+  }
+  r = await im1.post('/api/admin/inventory/products/bulk', {
+    products: [{ name: 'Usta moyi', type: 'oil', viscosity: '5W-30' }],
+  });
+  check(r.status === 403, 'P18.0 a master cannot create products in a batch either', `status=${r.status}`);
+  r = await isa.post('/api/admin/inventory/products/bulk', { products: 'not-an-array' });
+  check(r.status === 400, 'P18.0 a non-array body is refused with a message', `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  group('P18.1 One product through the batch endpoint');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [{ name: 'Bitta Oil', type: 'oil', brand: 'Zenith', viscosity: '10W-40', package_size: 4, minimum_quantity: 8, cost_price: 150000, initial_quantity: 40 }],
+  });
+  const bOne = r.data && r.data.products && r.data.products[0];
+  check(r.status === 201 && r.data.count === 1 && Array.isArray(r.data.products),
+    'P18.1 a one-product batch is accepted and answers with a list', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(bOne && bOne.name === 'Bitta Oil' && bOne.unit === 'liter' && bOne.current_quantity === 40,
+    'P18.1 the product came back fully populated', JSON.stringify(bOne));
+  check(bOne && bOne.state_label === 'Yetarli', 'P18.1 the batch carries the same decorated shape as the single endpoint', JSON.stringify(bOne && { state: bOne.state, state_label: bOne.state_label }));
+
+  group('P18.2 Two products in one request');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Ikki Oil A', type: 'oil', brand: 'Arex', viscosity: '5W-30', initial_quantity: 12 },
+      { name: 'Ikki Filter A', type: 'filter', brand: 'Arex', initial_quantity: 6 },
+    ],
+  });
+  check(r.status === 201 && r.data.count === 2 && r.data.products.length === 2,
+    'P18.2 both products are created by one request', `status=${r.status} ${JSON.stringify(r.data && r.data.count)}`);
+  check(r.data.products[0].unit === 'liter' && r.data.products[1].unit === 'piece',
+    'P18.2 each unit is derived from its own type', JSON.stringify(r.data.products.map((p) => [p.type, p.unit])));
+  check((await countNamed('Ikki Oil A')) === 1 && (await countNamed('Ikki Filter A')) === 1,
+    'P18.2 both rows are really in the table');
+
+  group('P18.3 Five products in one request');
+  const five = Array.from({ length: 5 }, (_, i) => ({
+    name: `Besh ${i + 1}`,
+    type: i % 2 === 0 ? 'oil' : 'filter',
+    brand: 'Beşburchak',
+    ...(i % 2 === 0 ? { viscosity: `5W-${30 + i}` } : {}),
+    initial_quantity: i + 1,
+  }));
+  r = await isa.post('/api/admin/inventory/products/bulk', { products: five });
+  check(r.status === 201 && r.data.count === 5, 'P18.3 a five-product batch is accepted', `status=${r.status} ${JSON.stringify(r.data && r.data.count)}`);
+  let allThere = true;
+  for (let i = 0; i < 5; i++) if ((await countNamed(`Besh ${i + 1}`)) !== 1) allThere = false;
+  check(allThere, 'P18.3 every one of the five is in the table', 'one of them was missing');
+
+  group('P18.4 Mixed oil and filter in the same batch');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Aralash Oil', type: 'oil', brand: 'Gulf', viscosity: '5W-30', unit: 'liter', package_size: 4, minimum_quantity: 20, cost_price: 45000, initial_quantity: 100 },
+      { name: 'Aralash Filter', type: 'filter', brand: 'Mann', unit: 'piece', package_size: 1, minimum_quantity: 5, cost_price: 35000, initial_quantity: 20 },
+    ],
+  });
+  check(r.status === 201, 'P18.4 the spec\'s own mixed example is accepted', `status=${r.status} ${JSON.stringify(r.data)}`);
+  const mixed = r.data.products;
+  check(mixed[0].unit === 'liter' && mixed[0].viscosity === '5W-30' && Number(mixed[0].current_quantity) === 100,
+    'P18.4 the oil kept its viscosity and 100 L', JSON.stringify(mixed[0]));
+  check(mixed[1].unit === 'piece' && mixed[1].viscosity === '' && Number(mixed[1].current_quantity) === 20,
+    'P18.4 the filter has no viscosity and 20 pieces', JSON.stringify(mixed[1]));
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Notogri Birlik', type: 'oil', viscosity: '5W-30', unit: 'piece' },
+    ],
+  });
+  check(r.status === 400, 'P18.4 oil measured in pieces is refused', `status=${r.status}`);
+
+  group('P18.5 An opening stock is a purchase movement, not a magic number');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [{ name: 'Kirim bilan', type: 'oil', brand: 'Idrol', viscosity: '5W-30', initial_quantity: 100 }],
+  });
+  const seeded = r.data.products[0];
+  const moves = await openingMovements(seeded.id);
+  check(moves.length === 1 && moves[0].movement_type === 'purchase',
+    'P18.5 the opening stock left exactly one purchase row', JSON.stringify(moves));
+  check(moves[0] && moves[0].before_quantity === 0 && moves[0].quantity === 100 && moves[0].after_quantity === 100,
+    'P18.5 the movement reads before 0, quantity 100, after 100', JSON.stringify(moves[0]));
+  const seedDetail = (await isa.get(`/api/admin/inventory/products/${seeded.id}`)).data;
+  check(seedDetail.totals.consistent === true,
+    'P18.5 the ledger already agrees with the level it created', JSON.stringify(seedDetail.totals));
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [{ name: 'Kiriemsiz', type: 'oil', brand: 'Idrol', viscosity: '5W-30' }],
+  });
+  const emptyStock = r.data.products[0];
+  check(Number(emptyStock.current_quantity) === 0 && (await openingMovements(emptyStock.id)).length === 0,
+    'P18.5 a product left blank starts empty with no movement row', JSON.stringify(emptyStock));
+  // `current_quantity` is the historical single-create spelling and must keep working.
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [{ name: 'Eski Kalit', type: 'filter', brand: 'Idrol', current_quantity: 7 }],
+  });
+  check(r.status === 201 && Number(r.data.products[0].current_quantity) === 7,
+    'P18.5 the older current_quantity spelling still seeds the stock', `status=${r.status} ${JSON.stringify(r.data.products && r.data.products[0])}`);
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [{ name: 'Kasrli Filtr', type: 'filter', brand: 'Idrol', initial_quantity: 1.5 }],
+  });
+  check(r.status === 400, 'P18.5 half a filter cannot be seeded -- it could never be consumed either', `status=${r.status}`);
+
+  group('P18.6 An invalid second product rolls the whole batch back');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Rollback One', type: 'oil', brand: 'Roll', viscosity: '5W-30', initial_quantity: 10 },
+      { name: 'Rollback Two', type: 'oil', brand: 'Roll' },
+      { name: 'Rollback Three', type: 'oil', brand: 'Roll', viscosity: '5W-30' },
+    ],
+  });
+  check(r.status === 400, 'P18.6 the batch is refused', `status=${r.status}`);
+  check(/2-mahsulot/.test((r.data && r.data.error) || ''),
+    'P18.6 the message names the second card, not just the field', JSON.stringify(r.data));
+  check((await countNamed('Rollback One')) === 0 && (await countNamed('Rollback Three')) === 0,
+    'P18.6 the valid products before and after the bad one were NOT saved -- no partial batch');
+  const leftoverMoves = await (async () => {
+    const c = legacyClient(PG_DB);
+    await c.connect();
+    const out = await c.query(
+      "SELECT COUNT(*)::int AS n FROM inventory_movements WHERE note = 'Boshlang''ich qoldiq' AND product_id IN (SELECT id FROM inventory_products WHERE name LIKE 'Rollback%')"
+    );
+    await c.end();
+    return out.rows[0].n;
+  })();
+  check(leftoverMoves === 0, 'P18.6 no opening movement survived either', `n=${leftoverMoves}`);
+
+  group('P18.7 An invalid third product saves nothing at all');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Uch Bir', type: 'oil', brand: 'Uch', viscosity: '5W-30', initial_quantity: 5 },
+      { name: 'Uch Ikki', type: 'filter', brand: 'Uch', initial_quantity: 5 },
+      { name: 'Uch Uch', type: 'oil', brand: 'Uch', viscosity: '5W-30', cost_price: '45000abc' },
+    ],
+  });
+  check(r.status === 400 && /3-mahsulot/.test((r.data && r.data.error) || ''),
+    'P18.7 the third card is named in the error', `status=${r.status} ${JSON.stringify(r.data)}`);
+  const threeGone = (await countNamed('Uch Bir')) === 0 && (await countNamed('Uch Ikki')) === 0 && (await countNamed('Uch Uch')) === 0;
+  check(threeGone, 'P18.7 not one of the three reached the warehouse');
+
+  group('P18.8 The batch itself is validated');
+  r = await isa.post('/api/admin/inventory/products/bulk', { products: [] });
+  check(r.status === 400 && /Kamida bitta/i.test(r.data.error), 'P18.8 an empty batch is refused', `${r.status} ${JSON.stringify(r.data)}`);
+  r = await isa.post('/api/admin/inventory/products/bulk', {});
+  check(r.status === 400, 'P18.8 a missing products key is refused', `status=${r.status} ${JSON.stringify(r.data)}`);
+  const twenty = Array.from({ length: 20 }, (_, i) => ({
+    name: `Yigirma ${i + 1}`, type: 'filter', brand: 'Chegaraviy',
+  }));
+  r = await isa.post('/api/admin/inventory/products/bulk', { products: twenty });
+  check(r.status === 201 && r.data.count === 20, 'P18.8 exactly at the cap the batch is accepted', `status=${r.status} ${JSON.stringify(r.data && r.data.count)}`);
+  r = await isa.post('/api/admin/inventory/products/bulk', { products: [...twenty, { name: 'Yigirma Bir', type: 'filter', brand: 'Chegaraviy' }] });
+  check(r.status === 400 && /ko'pi bilan 20 ta mahsulot/.test(r.data.error) && /hozir: 21/.test(r.data.error),
+    'P18.8 one past the cap is refused, and the message says what the cap is', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check((await countNamed('Yigirma Bir')) === 0, 'P18.8 the refused batch saved nothing, not even its first twenty');
+
+  group('P18.9 Every card is validated on its own terms');
+  const badCards = [
+    [{ type: 'oil', viscosity: '5W-30' }, 'a missing name'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', cost_price: -5 }, 'a negative price'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', package_size: 0 }, 'a zero package size'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', package_size: '4.5.6' }, 'a malformed package size'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', initial_quantity: -1 }, 'a negative opening stock'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', initial_quantity: '4.5abc' }, 'a partially numeric opening stock'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', initial_quantity: '1e3' }, 'an exponent in the opening stock'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', initial_quantity: 99999999999 }, 'an opening stock past the column width'],
+    [{ name: 'X', type: 'filter', viscosity: '5W-30' }, 'a filter carrying a viscosity'],
+    [{ name: 'X', type: 'grease' }, 'an unknown type'],
+  ];
+  for (const [card, label] of badCards) {
+    r = await isa.post('/api/admin/inventory/products/bulk', {
+      products: [{ name: 'Toza Oldingi', type: 'filter', brand: 'Tekshiruv' }, card],
+    });
+    check(r.status === 400 && /2-mahsulot/.test(r.data.error || ''),
+      `P18.9 ${label} is refused and blamed on the second card`, `status=${r.status} ${JSON.stringify(r.data)}`);
+  }
+  check((await countNamed('Toza Oldingi')) === 0,
+    'P18.9 none of the refused batches left its first product behind');
+
+  group('P18.10 A duplicate product is allowed, as before');
+  // inventory_products has no unique constraint on the name, and adding one would be
+  // a behaviour change the existing rows cannot satisfy: the same brand and
+  // viscosity can legitimately be stocked from two suppliers at different package
+  // sizes. So the batch must not silently start refusing what the single endpoint
+  // happily accepted twice.
+  r = await isa.post('/api/admin/inventory/products', { name: 'Ikki marta', type: 'oil', brand: 'Dubl', viscosity: '5W-30' });
+  const firstDouble = r.data.product.id;
+  r = await isa.post('/api/admin/inventory/products', { name: 'Ikki marta', type: 'oil', brand: 'Dubl', viscosity: '5W-30' });
+  check(r.status === 201 && r.data.product.id !== firstDouble,
+    'P18.10 the single endpoint still accepts the same name twice', `status=${r.status}`);
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Dublik Batch', type: 'oil', brand: 'Dubl', viscosity: '5W-30', initial_quantity: 4 },
+      { name: 'Dublik Batch', type: 'oil', brand: 'Dubl', viscosity: '5W-30', initial_quantity: 6 },
+    ],
+  });
+  check(r.status === 201 && r.data.count === 2, 'P18.10 a batch may contain the same product twice', `status=${r.status} ${JSON.stringify(r.data)}`);
+  const dupIds = r.data.products.map((p) => p.id);
+  check(dupIds[0] !== dupIds[1], 'P18.10 the duplicate became two distinct rows, not an upsert', JSON.stringify(dupIds));
+  check(Number(r.data.products[0].current_quantity) === 4 && Number(r.data.products[1].current_quantity) === 6,
+    'P18.10 each duplicate kept its own opening stock', JSON.stringify(r.data.products.map((p) => p.current_quantity)));
+  const dupDetail = (await isa.get(`/api/admin/inventory/products/${dupIds[0]}`)).data;
+  check(dupDetail.totals.consistent === true, 'P18.10 the duplicated product still reconciles', JSON.stringify(dupDetail.totals));
+
+  group('P18.11 Concurrent batches do not interfere');
+  const racing = await Promise.all([
+    isa.post('/api/admin/inventory/products/bulk', { products: [{ name: 'Paronlik 1', type: 'oil', brand: 'Paron', viscosity: '5W-30', initial_quantity: 5 }] }),
+    isa.post('/api/admin/inventory/products/bulk', { products: [{ name: 'Paronlik 2', type: 'oil', brand: 'Paron', viscosity: '5W-30', initial_quantity: 5 }] }),
+    isa.post('/api/admin/inventory/products/bulk', { products: [{ name: 'Paronlik 3', type: 'oil', brand: 'Paron', viscosity: '5W-30', initial_quantity: 5 }] }),
+    isa.post('/api/admin/inventory/products/bulk', { products: [{ name: 'Paronlik 4', type: 'oil', brand: 'Paron', viscosity: '5W-30' }, { name: 'Paronlik X', type: 'oil', brand: 'Paron' }] }),
+    isa.post('/api/admin/inventory/products/bulk', { products: [{ name: 'Paronlik 5', type: 'oil', brand: 'Paron', viscosity: '5W-30', initial_quantity: 5 }] }),
+  ]);
+  check(racing.filter((x) => x.status === 201).length === 4, 'P18.11 the four valid concurrent batches all succeeded', JSON.stringify(racing.map((x) => x.status)));
+  check(racing[3].status === 400, 'P18.11 the invalid one was refused', `status=${racing[3].status}`);
+  const raceIds = [1, 2, 5].map((i) => `Paronlik ${i}`);
+  let raceAll = true;
+  for (const name of raceIds) if ((await countNamed(name)) !== 1) raceAll = false;
+  check(raceAll, 'P18.11 each successful batch wrote its product exactly once', JSON.stringify(raceIds));
+  check((await countNamed('Paronlik X')) === 0, 'P18.11 the refused concurrent batch left nothing behind');
+
+  group('P18.12 A batched product behaves like any other');
+  r = await isa.get(`/api/admin/inventory/products?q=Kirim bilan`);
+  const batchedId = r.data.products[0].id;
+  const audit = (await isa.get(`/api/admin/inventory/products/${batchedId}`)).data.audit_logs;
+  const created = audit.find((a) => a.action === 'created');
+  check(!!created, 'P18.12 a batched product is audited as created', JSON.stringify(audit.map((a) => a.action)));
+  check(created && Number(JSON.parse(created.metadata || '{}').batch_size) === 1,
+    'P18.12 the audit row records which batch the product came from', created && created.metadata);
+  r = await isa.post(`/api/admin/inventory/products/${batchedId}/consume`, { quantity: 40 });
+  check(r.status === 201 && Number(r.data.product.current_quantity) === 60, 'P18.12 stock moves out of a batched product normally', `status=${r.status} ${JSON.stringify(r.data && r.data.product)}`);
+  check((await isa.get(`/api/admin/inventory/products/${batchedId}`)).data.totals.consistent === true,
+    'P18.12 and it still reconciles after being consumed');
+  r = await isa.patch(`/api/admin/inventory/products/${batchedId}`, { name: 'Kirim bilan (tahrirlangan)' });
+  check(r.status === 200 && r.data.product.name === 'Kirim bilan (tahrirlangan)',
+    'P18.12 a batched product can be edited like any other', `status=${r.status}`);
+  r = await isa.get('/api/admin/inventory/stats');
+  check(r.status === 200 && r.data.stats.oilTotal > 0 && r.data.stats.filterTotal > 0,
+    'P18.12 the dashboard totals still add up after a batch', JSON.stringify(r.data.stats));
+  r = await isa.get('/api/admin/inventory/export.csv');
+  check(r.status === 200 && r.buf.toString('utf8').includes('Bitta Oil'),
+    'P18.12 batched products appear in the export', `status=${r.status}`);
+
+  group('P18.13 The single-product endpoint is unchanged by the shared helper');
+  r = await isa.post('/api/admin/inventory/products', { name: 'Yakka Eski Usul', type: 'oil', brand: 'Eski', viscosity: '5W-30', current_quantity: 9 });
+  const singleSeeded = r.data && r.data.product;
+  check(r.status === 201 && Number(singleSeeded.current_quantity) === 9,
+    'P18.13 POST /products still seeds an opening stock from current_quantity', `status=${r.status} ${JSON.stringify(singleSeeded)}`);
+  check(singleSeeded && singleSeeded.opening_movement_id === undefined,
+    'P18.13 and still does not leak the internal movement id', JSON.stringify(singleSeeded));
+  check((await openingMovements(singleSeeded.id)).length === 1,
+    'P18.13 the single path still writes exactly one purchase movement');
+  r = await isa.post('/api/admin/inventory/products', { name: 'X', type: 'filter', current_quantity: 1.5 });
+  check(r.status === 400, 'P18.13 a fractional filter opening stock is refused on the single path too', `status=${r.status}`);
+
+  group('P18.14 The card list the operator actually sees');
+  // The behaviours below are what the modal does when the operator clicks. They live
+  // in a JSX-free module so they can be checked here without a browser.
+  let drafts = newClientDrafts();
+  check(drafts.length === 1, 'P18.14 the form opens with exactly one card', `n=${drafts.length}`);
+  check(!canClientRemove(drafts), 'P18.14 the last card cannot be removed');
+  let listRemoved = removeClientDraft(drafts, [], 0);
+  check(!listRemoved.removed && listRemoved.drafts.length === 1,
+    'P18.14 removing the only card is a no-op', JSON.stringify({ removed: listRemoved.removed, n: listRemoved.drafts.length }));
+
+  // 1 -> 2 -> 3, each card distinct and numbered by position.
+  const add1 = addClientDraft(drafts, []);
+  const add2 = addClientDraft(add1.drafts, add1.errors);
+  drafts = add2.drafts;
+  check(drafts.length === 3, 'P18.14 cards can be added one at a time', `n=${drafts.length}`);
+  check(new Set(drafts.map((d) => d.uid)).size === 3 && drafts.every((d) => typeof d.uid === 'number'),
+    'P18.14 every card has its own identity', JSON.stringify(drafts.map((d) => d.uid)));
+  check(add1.focusIndex === 1 && add2.focusIndex === 2,
+    'P18.14 the focus follows the card that was just added', `${add1.focusIndex} ${add2.focusIndex}`);
+
+  // Label the three cards, then delete the middle one: the list must close up.
+  let labelled = updateDraft(updateDraft(updateDraft(drafts, 0, { name: 'Birinchi' }), 1, { name: 'Ikkinchi' }), 2, { name: 'Uchinchi' });
+  const midRemoved = removeClientDraft(labelled, [], 1);
+  labelled = midRemoved.drafts;
+  check(labelled.length === 2, 'P18.14 a middle card can be removed', `n=${labelled.length}`);
+  check(labelled.map((d) => d.name).join(',') === 'Birinchi,Uchinchi',
+    'P18.14 the two survivors keep their own values, in order', labelled.map((d) => d.name).join(','));
+  check(midRemoved.focusIndex === 1, 'P18.14 the focus lands on the card that took the removed one\'s place', `focus=${midRemoved.focusIndex}`);
+  check(new Set(labelled.map((d) => d.uid)).size === 2, 'P18.14 no identity is reused after a delete', JSON.stringify(labelled.map((d) => d.uid)));
+
+  const tailRemoved = removeClientDraft(labelled, [], 1);
+  check(tailRemoved.drafts.map((d) => d.name).join(',') === 'Birinchi' && tailRemoved.focusIndex === 0,
+    'P18.14 removing the tail card moves the focus to the new last one', `${tailRemoved.drafts.map((d) => d.name)} focus=${tailRemoved.focusIndex}`);
+  check(!removeClientDraft(tailRemoved.drafts, [], 0).removed,
+    'P18.14 and once one card is left it stays put');
+
+  // The cap.
+  let many = newClientDrafts();
+  while (canClientAdd(many)) many = addClientDraft(many, []).drafts;
+  check(many.length === CLIENT_MAX_PRODUCTS, `P18.14 adding stops at ${CLIENT_MAX_PRODUCTS} cards`, `n=${many.length}`);
+  const overCap = addClientDraft(many, []);
+  check(!overCap.added && overCap.drafts.length === CLIENT_MAX_PRODUCTS,
+    'P18.14 the button at the cap adds nothing', JSON.stringify({ added: overCap.added, n: overCap.drafts.length }));
+  check(CLIENT_MAX_PRODUCTS === 20, 'P18.14 the cap is the one the server enforces', `cap=${CLIENT_MAX_PRODUCTS}`);
+  let capped = many;
+  for (let i = 0; i < 3; i++) capped = removeClientDraft(capped, [], 0).drafts;
+  check(capped.length === CLIENT_MAX_PRODUCTS - 3, 'P18.14 the cap is not a one-way door -- cards can be removed again', `n=${capped.length}`);
+
+  // Field edits touch one card only.
+  const twoCards = addClientDraft(newClientDrafts(), []).drafts;
+  const edited = updateDraft(updateDraft(twoCards, 0, { name: 'O\'zgartirildi' }), 1, { name: 'O\'zgartirilmadi' });
+  check(edited[0].name === 'O\'zgartirildi' && edited[1].name === 'O\'zgartirilmadi',
+    'P18.14 editing one card does not touch its neighbour', JSON.stringify(edited.map((d) => d.name)));
+
+  group('P18.15 The form knows which card a problem belongs to');
+  const oilNoViscosity = { ...emptyDraft(), name: 'Moy', brand: 'X', type: 'oil' };
+  const errs = validateDrafts([oilNoViscosity, { ...emptyDraft(), name: 'Filtr', brand: 'X', type: 'filter' }, { ...emptyDraft(), name: 'Uchinchi', brand: 'X', type: 'oil', viscosity: '5W-30' }]);
+  check(Object.keys(errs[0]).length === 1 && /1-mahsulot.*Viskozitet/.test(errs[0].viscosity),
+    'P18.15 a missing viscosity is reported against card 1', JSON.stringify(errs[0]));
+  check(Object.keys(errs[1]).length === 0, 'P18.15 a complete filter has no errors', JSON.stringify(errs[1]));
+  check(Object.keys(errs[2]).length === 0, 'P18.15 a complete oil has no errors', JSON.stringify(errs[2]));
+  check(firstInvalidIndex(errs) === 0, 'P18.15 the first bad card is the one to jump to', `${firstInvalidIndex(errs)}`);
+  check(firstInvalidIndex([{}, {}, {}]) === -1, 'P18.15 a clean batch has nothing to jump to');
+
+  // The field rules.
+  const qtyCases = [
+    [{ initial_quantity: '4.5' }, 'oil', false, 'a fractional oil opening stock is allowed'],
+    [{ initial_quantity: '2.75' }, 'oil', false, 'and so is a quarter-litre one'],
+    [{ initial_quantity: '1.5' }, 'filter', true, 'a fractional filter opening stock is refused'],
+    [{ initial_quantity: '10' }, 'filter', false, 'a whole filter opening stock is fine'],
+    [{ initial_quantity: '-1' }, 'oil', true, 'a negative opening stock is refused'],
+    [{ package_size: '0' }, 'oil', true, 'a zero package size is refused'],
+    [{ package_size: '4.5.6' }, 'oil', true, 'a malformed package size is refused'],
+    [{ cost_price: '-5' }, 'oil', true, 'a negative price is refused'],
+    [{ cost_price: '45000abc' }, 'oil', true, 'a partially numeric price is refused'],
+    [{ cost_price: '45000.50' }, 'oil', false, 'a price with cents is fine'],
+  ];
+  for (const [fields, type, expectError, label] of qtyCases) {
+    const draft = { ...emptyDraft(), name: 'Sinov', brand: 'Sinov', type, ...(type === 'oil' ? { viscosity: '5W-30' } : {}), ...fields };
+    const out = validateDrafts([draft])[0];
+    check(Boolean(Object.keys(out).length) === expectError, `P18.15 ${label}`, JSON.stringify(out));
+  }
+
+  // Switching to a filter clears the viscosity that only oil has.
+  const switched = switchType('filter');
+  check(switched.type === 'filter' && switched.viscosity === '', 'P18.15 switching to a filter clears the viscosity', JSON.stringify(switched));
+  check(Object.keys(validateDrafts([{ ...emptyDraft(), name: 'S', brand: 'S', type: 'filter', viscosity: '' }])[0]).length === 0,
+    'P18.15 and the resulting card is valid');
+  check(switchType('oil').viscosity === undefined, 'P18.15 switching back to oil does not invent a viscosity', JSON.stringify(switchType('oil')));
+
+  // Errors are cleared per field as the operator types.
+  const withError = [{ name: '1-mahsulot: Mahsulot nomi kiritilishi shart.', brand: 'boshqa xato' }];
+  const cleared = clearFieldError(withError, 0, ['name']);
+  check(Object.keys(cleared[0]).join(',') === 'brand',
+    'P18.15 editing a field clears its error and leaves the others on that card alone', JSON.stringify(cleared[0]));
+  check(clearFieldError(cleared, 0, ['viscosity']) === cleared,
+    'P18.15 a keystroke on an already-valid field re-renders nothing', 'a new array was allocated');
+  check(Object.keys(clearFieldError(cleared, 3, ['name'])[3] || {}).length === 0,
+    'P18.15 clearing on a card with no errors yet is harmless');
+
+  group('P18.16 The payload the form builds');
+  const oilPayload = draftPayload({ name: '  Castrol EDGE  ', type: 'oil', brand: ' Castrol ', viscosity: ' 5W-30 ', package_size: '4', minimum_quantity: '20', cost_price: '45000', initial_quantity: '100' });
+  check(JSON.stringify(oilPayload) === JSON.stringify({ name: 'Castrol EDGE', type: 'oil', brand: 'Castrol', unit: 'liter', viscosity: '5W-30', package_size: '4', minimum_quantity: '20', cost_price: '45000', initial_quantity: '100' }),
+    'P18.16 a filled oil card produces the spec\'s payload, trimmed', JSON.stringify(oilPayload));
+  const filterPayload = draftPayload({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', viscosity: '', package_size: '', minimum_quantity: '5', cost_price: '35000', initial_quantity: '20' });
+  check(filterPayload.unit === 'piece' && filterPayload.viscosity === undefined,
+    'P18.16 a filter never sends a viscosity', JSON.stringify(filterPayload));
+  check(filterPayload.package_size === undefined,
+    'P18.16 an untouched optional field is left out, so the server default applies', JSON.stringify(filterPayload));
+  check(filterPayload.initial_quantity === '20', 'P18.16 the opening stock uses the name the endpoint documents', JSON.stringify(filterPayload));
+
+  group('P18.17 A server error points back at its card');
+  check(focusFromServerMessage('3-mahsulot: Viskozitet majburiy', 5) === 2,
+    'P18.17 the position is read out of the message', `${focusFromServerMessage('3-mahsulot: x', 5)}`);
+  check(focusFromServerMessage('9-mahsulot: x', 5) === null,
+    'P18.17 a position past the last card is ignored rather than crashing the form');
+  check(focusFromServerMessage('Something else went wrong', 5) === null,
+    'P18.17 a message without a position still displays, just without the jump');
 }
 
 try {

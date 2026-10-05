@@ -1,7 +1,22 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../api';
 import Icon from '../../components/icons';
 import { Loading, Alert, Badge, Modal, Toggle } from '../../components/ui';
+import {
+  MAX_PRODUCTS,
+  addDraft as addDraftTo,
+  canAdd,
+  canRemove,
+  clearFieldError,
+  draftPayload,
+  firstInvalidIndex,
+  focusFromServerMessage,
+  newDrafts,
+  removeDraft as removeDraftFrom,
+  switchType,
+  updateDraft,
+  validateDrafts,
+} from './inventoryDrafts';
 
 /**
  * Oil and filter warehouse.
@@ -81,6 +96,16 @@ const EMPTY_FORM = {
   name: '', type: 'oil', brand: '', viscosity: '', unit: 'liter',
   package_size: '', minimum_quantity: '', cost_price: '', current_quantity: '',
 };
+
+/**
+ * The single-product form (`EMPTY_FORM`) is kept exactly as it was.
+ *
+ * The batch form lives in `inventoryDrafts.js` alongside its card, because the rules
+ * worth testing -- what happens when a card in the middle is removed, what happens
+ * at the cap, which card an error belongs to -- are array and string logic, and
+ * burying them in a JSX component makes them untestable without a browser. The
+ * component itself is `BulkProductModal` at the bottom of this file.
+ */
 
 export default function Inventory() {
   const [stats, setStats] = useState(null);
@@ -426,10 +451,11 @@ export default function Inventory() {
           setFormOpen(false);
           setEditing(null);
         }}
-        onSaved={async (created) => {
+        onSaved={async (created, count) => {
           setFormOpen(false);
           setEditing(null);
-          await afterChange(created ? 'Mahsulot omborga qo\'shildi.' : 'Mahsulot yangilandi.');
+          if (created && count > 1) return afterChange(`${count} ta mahsulot muvaffaqiyatli qo'shildi.`);
+          return afterChange(created ? 'Mahsulot omborga qo\'shildi.' : 'Mahsulot yangilandi.');
         }}
       />
       <StockInModal product={stockFor} onClose={() => setStockFor(null)} onSaved={() => { setStockFor(null); return afterChange('Omborga qo\'shildi.'); }} />
@@ -799,17 +825,24 @@ function MovementRow({ m, compact }) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Add / edit form.
+ * Edit form. One product.
  *
  * Viscosity is shown only for oil and is required there; unit is never a free
  * choice because it follows from the type. Both rules are enforced again on the
  * server -- this is convenience, not the defence.
+ *
+ * Editing stays a single-product operation on purpose. Adding is the batch case and
+ * has its own form below; mixing the two would mean a card array and an activation
+ * toggle sharing one piece of state.
+ *
+ * Note there is no quantity field here: stock is never edited directly, only moved
+ * through the stock endpoints, so a control that the server would reject is not
+ * offered.
  */
-function ProductFormModal({ open, product, onClose, onSaved }) {
+function EditProductModal({ open, product, onClose, onSaved }) {
   const [form, setForm] = useState(EMPTY_FORM);
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
-  const editing = Boolean(product);
 
   useEffect(() => {
     if (!open) return;
@@ -836,6 +869,8 @@ function ProductFormModal({ open, product, onClose, onSaved }) {
 
   async function onSubmit(e) {
     e.preventDefault();
+    // A second click while the request is in flight would submit the same edit twice.
+    if (busy) return;
     setMsg(null);
     setBusy(true);
     try {
@@ -849,16 +884,8 @@ function ProductFormModal({ open, product, onClose, onSaved }) {
         cost_price: form.cost_price,
       };
       if (isOil) payload.viscosity = form.viscosity;
-      // Opening stock is only settable at creation; afterwards it must move
-      // through the stock endpoints so the ledger stays truthful.
-      if (!editing && form.current_quantity) payload.current_quantity = form.current_quantity;
-
-      if (editing) {
-        await api.patch(`/admin/inventory/products/${product.id}`, payload);
-      } else {
-        await api.post('/admin/inventory/products', payload);
-      }
-      await onSaved(!editing);
+      await api.patch(`/admin/inventory/products/${product.id}`, payload);
+      await onSaved(false);
     } catch (err) {
       setMsg({ kind: 'error', text: err.message });
     } finally {
@@ -867,30 +894,18 @@ function ProductFormModal({ open, product, onClose, onSaved }) {
   }
 
   return (
-    <Modal open={open} onClose={onClose} title={editing ? 'Mahsulotni tahrirlash' : 'Mahsulot qo\'shish'} wide>
+    <Modal open={open} onClose={onClose} title="Mahsulotni tahrirlash" wide>
       <form onSubmit={onSubmit} className="space-y-4">
         {msg && <Alert kind={msg.kind}>{msg.text}</Alert>}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
             <label className="label">Mahsulot turi *</label>
-            <select
-              className="field"
-              value={form.type}
-              disabled={editing}
-              onChange={(e) =>
-                setForm({
-                  ...form,
-                  type: e.target.value,
-                  unit: e.target.value === 'oil' ? 'liter' : 'piece',
-                  viscosity: e.target.value === 'filter' ? '' : form.viscosity,
-                })
-              }
-            >
+            <select className="field" value={form.type} disabled onChange={() => {}}>
               <option value="oil" className="bg-[#111725]">Moy</option>
               <option value="filter" className="bg-[#111725]">Filtr</option>
             </select>
-            {editing && <p className="mt-1 text-xs text-white/35">Tur bo\'yicha o\'zgartirish arxivlash orqali amalga oshiriladi.</p>}
+            <p className="mt-1 text-xs text-white/35">Tur bo\'yicha o\'zgartirish arxivlash orqali amalga oshiriladi.</p>
           </div>
           <div>
             <label className="label">Nomi *</label>
@@ -908,7 +923,7 @@ function ProductFormModal({ open, product, onClose, onSaved }) {
           )}
           <div>
             <label className="label">Birlik</label>
-            <input className="field" value={isOil ? 'liter' : 'dona'} disabled />
+            <input className="field" value={isOil ? 'liter' : 'dona'} disabled readOnly />
           </div>
           <div>
             <label className="label">Qadoq hajmi ({isOil ? 'L' : 'dona'})</label>
@@ -922,35 +937,26 @@ function ProductFormModal({ open, product, onClose, onSaved }) {
             <label className="label">Kelish narxi (so'm)</label>
             <input className="field" inputMode="decimal" value={form.cost_price} onChange={set('cost_price')} placeholder="45000" />
           </div>
-          {!editing && (
-            <div>
-              <label className="label">Boshlang'ich qoldiq</label>
-              <input className="field" inputMode="decimal" value={form.current_quantity} onChange={set('current_quantity')} placeholder="0" />
-              <p className="mt-1 text-xs text-white/35">Kirim harakati sifatida yoziladi.</p>
-            </div>
-          )}
         </div>
 
-        {editing && (
-          <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
-            <div>
-              <div className="text-sm font-semibold">Faol mahsulot</div>
-              <div className="text-xs text-white/40">O\'chirilgan mahsulot tanlovchilarda ko\'rinmaydi, tarixi saqlanadi.</div>
-            </div>
-            <Toggle
-              checked={Number(product.is_active) === 1}
-              label="Faol"
-              onChange={async (next) => {
-                try {
-                  await api.patch(`/admin/inventory/products/${product.id}`, { is_active: next ? 1 : 0 });
-                  await onSaved(false);
-                } catch (err) {
-                  setMsg({ kind: 'error', text: err.message });
-                }
-              }}
-            />
+        <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold">Faol mahsulot</div>
+            <div className="text-xs text-white/40">O\'chirilgan mahsulot tanlovchilarda ko\'rinmaydi, tarixi saqlanadi.</div>
           </div>
-        )}
+          <Toggle
+            checked={Number(product.is_active) === 1}
+            label="Faol"
+            onChange={async (next) => {
+              try {
+                await api.patch(`/admin/inventory/products/${product.id}`, { is_active: next ? 1 : 0 });
+                await onSaved(false);
+              } catch (err) {
+                setMsg({ kind: 'error', text: err.message });
+              }
+            }}
+          />
+        </div>
 
         <div className="flex justify-end gap-3 pt-2">
           <button type="button" onClick={onClose} className="rounded-xl border border-white/15 px-5 py-2.5 text-sm text-white/80 hover:bg-white/5">Bekor qilish</button>
@@ -961,6 +967,339 @@ function ProductFormModal({ open, product, onClose, onSaved }) {
       </form>
     </Modal>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* Multi-product add form                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One product card in the batch form.
+ *
+ * The fields follow the type: viscosity exists only for oil, and the unit is a
+ * disabled readout rather than a choice because it is derived from the type on the
+ * server too. The grid is one column on a phone and two on a desktop, which is what
+ * the `sm:grid-cols-2` does, and the opening-stock field spans both columns because
+ * it carries a hint line of its own.
+ */
+function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputRef, highlighted }) {
+  const isOil = draft.type === 'oil';
+  const field = (key) => (e) => onChange({ [key]: e.target.value });
+  // A red ring on the inputs that failed, so the offending card is findable by
+  // scanning the form rather than by reading eight messages.
+  const ring = (key) => (errors[key] ? '!border-red-500/60' : '');
+  const hint = (key) => (errors[key] ? <p className="mt-1 text-xs text-red-300">{errors[key]}</p> : null);
+
+  return (
+    <div
+      className={`rounded-2xl border bg-white/[0.03] p-4 transition-colors ${
+        highlighted ? 'border-[rgb(var(--c-primary))]/50' : 'border-white/10'
+      }`}
+    >
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <span className="flex h-7 min-w-7 items-center justify-center rounded-full border border-white/15 bg-white/[0.06] px-2 text-xs font-bold tabular-nums text-white/80">
+          {index + 1}
+        </span>
+        <button
+          type="button"
+          onClick={onRemove}
+          disabled={!removable}
+          title={removable ? 'Bu mahsulotni olib tashlash' : 'Kamida bitta mahsulot qolishi kerak'}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/40 px-2.5 py-1.5 text-xs font-semibold text-red-300 transition hover:bg-red-500/15 disabled:cursor-not-allowed disabled:border-white/10 disabled:text-white/25 disabled:hover:bg-transparent"
+        >
+          <Icon name="trash" size={14} />
+          O&apos;chirish
+        </button>
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <label className="label">Mahsulot turi *</label>
+          <select className="field" value={draft.type} onChange={(e) => onChange(switchType(e.target.value))}>
+            <option value="oil" className="bg-[#111725]">Moy</option>
+            <option value="filter" className="bg-[#111725]">Filtr</option>
+          </select>
+        </div>
+        <div>
+          <label className="label">Nomi *</label>
+          <input
+            ref={inputRef}
+            className={`field ${ring('name')}`}
+            value={draft.name}
+            onChange={field('name')}
+            placeholder={isOil ? 'Castrol EDGE' : 'MANN Oil Filter'}
+            maxLength={150}
+          />
+          {hint('name')}
+        </div>
+        <div>
+          <label className="label">Brend *</label>
+          <input
+            className={`field ${ring('brand')}`}
+            value={draft.brand}
+            onChange={field('brand')}
+            placeholder={isOil ? 'Castrol' : 'MANN'}
+            maxLength={80}
+          />
+          {hint('brand')}
+        </div>
+        {isOil && (
+          <div>
+            <label className="label">Viskozitet *</label>
+            <input
+              className={`field ${ring('viscosity')}`}
+              value={draft.viscosity}
+              onChange={field('viscosity')}
+              placeholder="5W-30"
+              maxLength={30}
+            />
+            {hint('viscosity')}
+          </div>
+        )}
+        <div>
+          <label className="label">Birlik</label>
+          {/* Shown translated, like every other unit in this page: the stored value
+              is `piece`, but the operator reads `dona` everywhere else. */}
+          <input className="field" value={isOil ? 'liter' : 'dona'} disabled readOnly />
+        </div>
+        <div>
+          <label className="label">Qadoq hajmi ({isOil ? 'L' : 'dona'})</label>
+          <input
+            className={`field ${ring('package_size')}`}
+            inputMode="decimal"
+            value={draft.package_size}
+            onChange={field('package_size')}
+            placeholder={isOil ? '4' : '1'}
+          />
+          {hint('package_size')}
+        </div>
+        <div>
+          <label className="label">Minimal qoldiq</label>
+          <input
+            className={`field ${ring('minimum_quantity')}`}
+            inputMode="decimal"
+            value={draft.minimum_quantity}
+            onChange={field('minimum_quantity')}
+            placeholder={isOil ? '20' : '5'}
+          />
+          {hint('minimum_quantity')}
+        </div>
+        <div>
+          <label className="label">Kelish narxi (so&apos;m)</label>
+          <input
+            className={`field ${ring('cost_price')}`}
+            inputMode="decimal"
+            value={draft.cost_price}
+            onChange={field('cost_price')}
+            placeholder="45000"
+          />
+          {hint('cost_price')}
+        </div>
+        <div className="sm:col-span-2">
+          <label className="label">Boshlang&apos;ich qoldiq</label>
+          <input
+            className={`field ${ring('initial_quantity')}`}
+            inputMode="decimal"
+            value={draft.initial_quantity}
+            onChange={field('initial_quantity')}
+            placeholder="0"
+          />
+          <p className="mt-1 text-xs text-white/35">Kirim harakati sifatida yoziladi.</p>
+          {hint('initial_quantity')}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Add many products at once.
+ *
+ * Every card is one product, numbered in the order it appears, and the whole set is
+ * submitted as a single request. The server commits them in one transaction, so the
+ * operator gets all of them or none: a typo in the sixth card cannot leave the first
+ * five sitting in the warehouse with no way to tell that is what happened.
+ *
+ * The panel is the `footer` layout of `Modal`: the header and the footer stay pinned
+ * and only the card list scrolls, so the Save button is reachable no matter how many
+ * cards are open, and the modal never grows past 90vh.
+ *
+ * The list rules (add, remove, renumber, cap) and the field validation live in
+ * `inventoryDrafts.js`, free of JSX so they can be asserted directly; this component
+ * renders them and owns the focus.
+ */
+function BulkProductModal({ open, onClose, onSaved }) {
+  const [drafts, setDrafts] = useState(newDrafts);
+  const [errors, setErrors] = useState([]);
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [focusIndex, setFocusIndex] = useState(0);
+  const cardRefs = useRef([]);
+  const nameRefs = useRef([]);
+
+  // Re-seed on open so a previous batch's drafts -- and its errors -- can never
+  // survive into the next one. Keyed on `open`, so it only fires on the transition.
+  useEffect(() => {
+    if (!open) return;
+    setDrafts(newDrafts());
+    setErrors([]);
+    setMsg(null);
+    setBusy(false);
+    setFocusIndex(0);
+  }, [open]);
+
+  // Put the cursor on the card the operator was last pointed at: the first one when
+  // the modal opens, the new one after "+ Yana mahsulot qo'shish", and the card that
+  // failed when the form or the server points at one.
+  useEffect(() => {
+    if (!open) return;
+    const input = nameRefs.current[focusIndex];
+    if (input) input.focus();
+    const card = cardRefs.current[focusIndex];
+    if (card && focusIndex > 0) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [open, focusIndex, drafts.length]);
+
+  function update(index, patch) {
+    setDrafts((prev) => updateDraft(prev, index, patch));
+    // Editing a field clears its error at once; leaving a red message under an input
+    // the operator has just fixed is only noise.
+    setErrors((prev) => clearFieldError(prev, index, Object.keys(patch)));
+  }
+
+  function onAdd() {
+    const next = addDraftTo(drafts, errors);
+    if (!next.added) return;
+    setDrafts(next.drafts);
+    setErrors(next.errors);
+    setFocusIndex(next.focusIndex);
+  }
+
+  function onRemove(index) {
+    const next = removeDraftFrom(drafts, errors, index);
+    if (!next.removed) return;
+    setDrafts(next.drafts);
+    setErrors(next.errors);
+    // The numbers renumber themselves, because each card renders its own position;
+    // only the focus has to be moved deliberately.
+    setFocusIndex(next.focusIndex);
+  }
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    // A second click while the request is in flight would submit the batch twice.
+    if (busy) return;
+
+    const nextErrors = validateDrafts(drafts);
+    const firstBad = firstInvalidIndex(nextErrors);
+    if (firstBad !== -1) {
+      setErrors(nextErrors);
+      setMsg({ kind: 'error', text: 'Ba\'zi maydonlar to\'ldirilmagan yoki noto\'g\'ri. Qizil belgilangan joylarni tuzatib qayta urinib ko\'ring.' });
+      setFocusIndex(firstBad);
+      return;
+    }
+
+    setErrors([]);
+    setMsg(null);
+    setBusy(true);
+    try {
+      const res = await api.post('/admin/inventory/products/bulk', {
+        products: drafts.map(draftPayload),
+      });
+      await onSaved(true, (res && res.count) || drafts.length);
+    } catch (err) {
+      // The endpoint prefixes its message with the position ("3-mahsulot: Viskozitet
+      // majburiy"), so the message is shown as-is and the digits are read back out to
+      // move the operator to the exact card that failed.
+      setMsg({ kind: 'error', text: err.message });
+      const index = focusFromServerMessage(err.message, drafts.length);
+      if (index !== null) setFocusIndex(index);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const atLimit = !canAdd(drafts);
+
+  return (
+    <Modal
+      open={open}
+      onClose={busy ? () => {} : onClose}
+      title="Mahsulot qo'shish"
+      wide
+      footer={
+        <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-xs text-white/40">
+            {drafts.length} ta mahsulot{atLimit ? ` · maksimal ${MAX_PRODUCTS} ta` : ''}
+          </span>
+          <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={busy}
+              className="flex-1 rounded-xl border border-white/15 px-5 py-2.5 text-sm font-medium text-white/80 transition hover:bg-white/5 disabled:opacity-40 sm:flex-none"
+            >
+              Bekor qilish
+            </button>
+            <button
+              type="submit"
+              form="bulk-product-form"
+              disabled={busy}
+              className="btn-primary flex-1 !py-2.5 text-sm disabled:opacity-60 sm:flex-none"
+            >
+              {busy ? 'Saqlanmoqda...' : `Saqlash${drafts.length > 1 ? ` (${drafts.length})` : ''}`}
+            </button>
+          </div>
+        </div>
+      }
+    >
+      <form id="bulk-product-form" onSubmit={onSubmit} className="space-y-4" noValidate>
+        {msg && <Alert kind={msg.kind}>{msg.text}</Alert>}
+
+        {drafts.map((draft, index) => (
+          <div
+            key={draft.uid}
+            ref={(el) => {
+              cardRefs.current[index] = el;
+            }}
+            className="animate-fade-up"
+          >
+            <DraftCard
+              index={index}
+              draft={draft}
+              errors={errors[index] || {}}
+              removable={canRemove(drafts)}
+              highlighted={focusIndex === index}
+              onChange={(patch) => update(index, patch)}
+              onRemove={() => onRemove(index)}
+              inputRef={(el) => {
+                nameRefs.current[index] = el;
+              }}
+            />
+          </div>
+        ))}
+
+        <button
+          type="button"
+          onClick={onAdd}
+          disabled={atLimit || busy}
+          className="flex w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-white/20 bg-white/[0.02] px-5 py-4 text-sm font-semibold text-white/70 transition hover:border-white/35 hover:bg-white/5 hover:text-white disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:border-white/20 disabled:hover:bg-white/[0.02] disabled:hover:text-white/70"
+        >
+          <Icon name="pluss" size={16} />
+          {atLimit ? `Maksimal ${MAX_PRODUCTS} ta mahsulot qo'shildi` : '+ Yana mahsulot qo\'shish'}
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+/**
+ * Chooses between the two forms.
+ *
+ * The branch lives here rather than inside either form so the edit form stays exactly
+ * what it was and the batch form never carries the single-product branches.
+ */
+function ProductFormModal(props) {
+  return props.product ? <EditProductModal {...props} /> : <BulkProductModal {...props} />;
 }
 
 /** Shared body for the three stock movements: a quantity, an optional note. */
