@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 import EmbeddedPostgres from 'embedded-postgres';
 import pgDriver from 'pg';
 // The batch form's card-list rules live in a JSX-free module precisely so they can be
@@ -159,6 +160,150 @@ function pngForm(field, name) {
   const fd = new FormData();
   fd.append(field, new Blob([PNG], { type: 'image/png' }), name);
   return fd;
+}
+
+// ----------------------------------------------------------------- xlsx reader
+/**
+ * Minimal ZIP reader, just enough to open an .xlsx.
+ *
+ * An .xlsx is a ZIP of XML parts. Asserting on the raw bytes would only prove the
+ * file is non-empty; opening the package and reading the cells is what actually
+ * proves the operator will see a spreadsheet. Deliberately dependency-free: the
+ * thing under test is the server's output, so the check must not lean on the same
+ * library that wrote it.
+ */
+function readZip(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 66000; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a zip: no end-of-central-directory record');
+
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const entries = new Map();
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('corrupt central directory');
+    const method = buf.readUInt16LE(off + 10);
+    const csize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const cmtLen = buf.readUInt16LE(off + 32);
+    const lho = buf.readUInt32LE(off + 42);
+    entries.set(buf.toString('utf8', off + 46, off + 46 + nameLen), { method, csize, lho });
+    off += 46 + nameLen + extraLen + cmtLen;
+  }
+
+  return {
+    names: [...entries.keys()],
+    text(name) {
+      const e = entries.get(name);
+      if (!e) throw new Error(`missing zip entry ${name}`);
+      // Sizes come from the central directory, not the local header: a streamed
+      // entry leaves the local sizes zero and puts the truth in a data descriptor.
+      const start = e.lho + 30 + buf.readUInt16LE(e.lho + 26) + buf.readUInt16LE(e.lho + 28);
+      const raw = buf.subarray(start, start + e.csize);
+      return e.method === 0 ? raw.toString('utf8') : zlib.inflateRawSync(raw).toString('utf8');
+    },
+  };
+}
+
+function xmlUnescape(s) {
+  return String(s)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(Number(d)))
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Opens an .xlsx and returns its sheets as row/cell maps, keeping each cell's
+ * declared type. The type is the point: "1 500 000" stored as text is not a
+ * number, and a test that flattens to strings cannot tell the difference.
+ *
+ * The data region is read from the sheet's own <autoFilter> range rather than
+ * "every row after the header". That is both the honest definition of the table
+ * and the reason a totals block below the table is not mistaken for data: the
+ * file declares where its table ends.
+ *
+ * Returns { names, sheet(name), allText() } where sheet() yields
+ * { headers, rows, allRows, autofilter }, and each cell is { value, type } with
+ * type 'n' numeric, 's' shared string, 'inline' inline string, or 'empty'.
+ */
+function readXlsx(buf) {
+  const zip = readZip(buf);
+  const shared = [...(zip.names.includes('xl/sharedStrings.xml') ? zip.text('xl/sharedStrings.xml') : '')
+    .matchAll(/<si>([\s\S]*?)<\/si>/g)]
+    .map((m) => [...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((t) => xmlUnescape(t[1])).join(''));
+
+  const names = [...zip.text('xl/workbook.xml').matchAll(/<sheet[^>]*\bname="([^"]*)"/g)]
+    .map((m) => xmlUnescape(m[1]));
+
+  function rowsOf(xml) {
+    const out = [];
+    for (const rm of xml.matchAll(/<row([^>]*)>([\s\S]*?)<\/row>/g)) {
+      const rn = Number(/\br="(\d+)"/.exec(rm[1])?.[1] || out.length + 1);
+      const cells = {};
+      for (const cm of rm[2].matchAll(/<c\s+([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+        const ref = /r="([A-Z]+)\d+"/.exec(cm[1]);
+        if (!ref) continue;
+        const declared = /\bt="([^"]+)"/.exec(cm[1]);
+        const inner = cm[2] || '';
+        const inline = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+        const v = /<v>([\s\S]*?)<\/v>/.exec(inner);
+        let value = null;
+        let type = declared ? declared[1] : 'n';
+        if (inline) { value = xmlUnescape(inline[1]); type = 'inline'; }
+        else if (v) value = type === 's' ? shared[Number(v[1])] : xmlUnescape(v[1]);
+        cells[ref[1]] = { value, type };
+      }
+      out.push({ row: rn, cells });
+    }
+    return out;
+  }
+
+  return {
+    names,
+    sheet(name) {
+      const i = names.indexOf(name);
+      if (i < 0) throw new Error(`no sheet named ${name} (have: ${names.join(', ')})`);
+      const xml = zip.text(`xl/worksheets/sheet${i + 1}.xml`);
+      const allRows = rowsOf(xml);
+      const afRef = /<autoFilter[^>]*\bref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/.exec(xml);
+      // Rows inside the declared table, header excluded.
+      const lastDataRow = afRef ? Number(afRef[4]) : allRows.length;
+      const headerRow = allRows.find((r) => r.row === 1)?.cells || {};
+      const headers = Object.entries(headerRow)
+        .sort((a, b) => colIndex(a[0]) - colIndex(b[0]))
+        .map(([, c]) => c.value);
+      const colOf = {};
+      Object.entries(headerRow).forEach(([col, c]) => { colOf[c.value] = col; });
+      const empty = { value: null, type: 'empty' };
+      const project = (cells) => headers.map((h) => (colOf[h] ? cells[colOf[h]] || empty : empty));
+      return {
+        headers,
+        autofilter: afRef ? afRef[0].replace(/.*ref="/, '').replace('"', '') : null,
+        rows: allRows.filter((r) => r.row > 1 && r.row <= lastDataRow && Object.keys(r.cells).length)
+          .map((r) => project(r.cells)),
+        allRows: allRows.map((r) => ({ row: r.row, cells: project(r.cells) })),
+      };
+    },
+    /** Every string in the package, for "this value must not appear" assertions. */
+    allText() {
+      return zip.names
+        .filter((n) => n.endsWith('.xml') || n.endsWith('.rels'))
+        .map((n) => zip.text(n))
+        .join('\n');
+    },
+  };
+}
+
+function colIndex(col) {
+  let n = 0;
+  for (const ch of col) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n;
 }
 
 // ---------------------------------------------------------------- fixtures
@@ -1685,8 +1830,6 @@ async function readinessTests() {
   check(r.status === 400, 'P16.2 a missing name is refused', `status=${r.status}`);
   r = await dsa.post('/api/admin/debts', { full_name: 'A', address: 'Urganch', service: 'Moy', debt_amount: 1000 });
   check(r.status === 400, 'P16.2 a missing phone is refused');
-  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', service: 'Moy', debt_amount: 1000 });
-  check(r.status === 400, 'P16.2 a missing address is refused');
   r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', debt_amount: 1000 });
   check(r.status === 400, 'P16.2 a missing service is refused');
   r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy' });
@@ -1766,7 +1909,7 @@ async function readinessTests() {
   r = await dsa.get('/api/admin/debts?q=901000002');
   check(r.data.debts.length === 1, 'P16.6 search matches the phone');
   r = await dsa.get('/api/admin/debts?q=Termiz');
-  check(r.data.debts.length === 1, 'P16.6 search matches the address');
+  check(r.data.debts.length === 0, 'P16.6 a legacy address is no longer searchable, so no row surfaces on a term the UI cannot explain', `n=${r.data.debts.length}`);
   r = await dsa.get('/api/admin/debts?q=Tormoz');
   check(r.data.debts.length >= 2, 'P16.6 search matches the service');
   r = await dsa.get('/api/admin/debts?filter=paid');
@@ -1975,6 +2118,310 @@ async function readinessTests() {
     check(!nokeyLogText.includes(DEBT_PASS_KEY), 'P16.17 nothing about the key reaches the logs');
   }
   nokey.kill('SIGTERM');
+
+  // =========================================================================
+  // P19. Excel export of the debt ledger
+  // =========================================================================
+  group('P19.1 The workbook is a real, downloadable .xlsx');
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx');
+  const xlsxDisp = String(r.headers.get('content-disposition') || '');
+  check(r.status === 200, 'P19.1 GET /export.xlsx answers 200', `status=${r.status}`);
+  check(
+    (r.headers.get('content-type') || '').includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+    'P19.1 the content type is the OOXML spreadsheet type', `type=${r.headers.get('content-type')}`
+  );
+  check(/attachment/i.test(xlsxDisp) && /filename="qarz-daftari-\d{4}-\d{2}-\d{2}\.xlsx"/.test(xlsxDisp),
+    'P19.1 it is attached as a dated .xlsx, not shown inline', `disp=${xlsxDisp}`);
+  check(r.buf.subarray(0, 2).toString('latin1') === 'PK', 'P19.1 the payload is a ZIP package', r.buf.subarray(0, 8).toString('hex'));
+  check(Number(r.headers.get('content-length')) === r.buf.length, 'P19.1 Content-Length matches the body actually sent');
+  check((r.headers.get('cache-control') || '').includes('no-store'), 'P19.1 a ledger export is not cached');
+
+  let xl = null;
+  try { xl = readXlsx(r.buf); check(true, 'P19.1 the package opens and its parts parse'); }
+  catch (e) { check(false, 'P19.1 the package opens and its parts parse', String(e && e.message)); }
+
+  group('P19.2 Three sheets, named for what each one answers');
+  if (xl) {
+    check(xl.names.length === 3, 'P19.2 the workbook has exactly three sheets', `n=${xl.names.length} names=${xl.names.join('|')}`);
+    check(xl.names.join('|') === 'Qarzlar|To\'lovlar|Audit', 'P19.2 sheet order is debts, payments, audit', `names=${xl.names.join('|')}`);
+  }
+
+  group('P19.3 The debts sheet carries the ledger, and no address');
+  if (xl) {
+    const debts = xl.sheet('Qarzlar');
+    for (const h of ['F.I.Sh.', 'Telefon', 'Xizmat', 'Qarz summasi', "To'langan summa", 'Qolgan summa', 'Holati', 'Yaratilgan sana']) {
+      check(debts.headers.includes(h), `P19.3 the debts sheet has the "${h}" column`, `headers=${debts.headers.join('|')}`);
+    }
+    check(!debts.headers.some((h) => /manzil|address/i.test(h)), 'P19.3 no address column', `headers=${debts.headers.join('|')}`);
+    check(!xl.allText().includes('Yashash joyi'), 'P19.3 the retired address header is nowhere in the package');
+    const iIsm = debts.headers.indexOf('F.I.Sh.');
+    check(!!debts.rows.find((row) => row[iIsm]?.value === 'Alisher Karimov'), 'P19.3 a debt created earlier in this run appears in the sheet');
+    check(!!debts.autofilter, 'P19.3 the table range is declared, so Excel offers its own filters', `ref=${debts.autofilter}`);
+  }
+
+  group('P19.4 The payments sheet is the complete payment history');
+  if (xl) {
+    const pays = xl.sheet("To'lovlar");
+    for (const h of ["To'lov ID", 'Qarz ID', "To'lov summasi", "To'lov sanasi", 'Izoh', 'Admin']) {
+      check(pays.headers.includes(h), `P19.4 the payments sheet has the "${h}" column`, `headers=${pays.headers.join('|')}`);
+    }
+    check(!pays.headers.some((h) => /manzil|address/i.test(h)), 'P19.4 no address column');
+    // dAli took two payments (P16.4) and dSev one (P16.3). Both must be listed:
+    // the sheet reports movements, not one row per debt.
+    check(pays.rows.length >= 3, 'P19.4 every payment is its own row, not one summary row per debt', `n=${pays.rows.length}`);
+    const iIsm = pays.headers.indexOf('F.I.Sh.');
+    const alisherPays = pays.rows.filter((row) => row[iIsm]?.value === 'Alisher Karimov');
+    check(alisherPays.length === 2, 'P19.4 both of one debtor\'s payments are listed', `n=${alisherPays.length}`);
+    const iIzoh = pays.headers.indexOf('Izoh');
+    check(alisherPays.some((row) => String(row[iIzoh].value || '').includes('naqd pul')), 'P19.4 the payment note travels with it');
+  }
+
+  group('P19.5 The audit sheet is the complete action trail');
+  if (xl) {
+    const aud = xl.sheet('Audit');
+    for (const h of ['Action', 'Admin', 'Sana', 'Izoh']) {
+      check(aud.headers.includes(h), `P19.5 the audit sheet has the "${h}" column`, `headers=${aud.headers.join('|')}`);
+    }
+    check(aud.rows.length > 0, 'P19.5 there is at least one audited action to report', `n=${aud.rows.length}`);
+    const iId = aud.headers.indexOf('Qarz ID');
+    check(aud.rows.some((row) => Number(row[iId].value) === Number(dAli.id)), 'P19.5 the audit trail is tied to the debts in the ledger');
+    const iAct = aud.headers.indexOf('Action');
+    const acts = new Set(aud.rows.map((row) => row[iAct].value));
+    check(acts.size >= 2, 'P19.5 it covers more than one kind of action, so it is a trail and not a single event', [...acts].join('|'));
+  }
+
+  group('P19.6 Money is a number and a date is a date');
+  if (xl) {
+    const debts = xl.sheet('Qarzlar');
+    const [iQarz, iPaid, iQolgan, iSana] = ['Qarz summasi', "To'langan summa", 'Qolgan summa', 'Yaratilgan sana'].map((h) => debts.headers.indexOf(h));
+    const iIsm = debts.headers.indexOf('F.I.Sh.');
+    const alisher = debts.rows.find((row) => row[iIsm]?.value === 'Alisher Karimov');
+    check(alisher[iQarz].type === 'n' && Number(alisher[iQarz].value) === 500000,
+      'P19.6 Qarz summasi is numeric with the exact value, so Excel can total it', `type=${alisher[iQarz].type} value=${alisher[iQarz].value}`);
+    check(alisher[iPaid].type === 'n' && Number(alisher[iPaid].value) === 500000,
+      "P19.6 To'langan summa is numeric too", `type=${alisher[iPaid].type} value=${alisher[iPaid].value}`);
+    check(alisher[iQolgan].type === 'n' && Number(alisher[iQolgan].value) === 0,
+      'P19.6 Qolgan summa is numeric', `type=${alisher[iQolgan].type} value=${alisher[iQolgan].value}`);
+    // A date cell is a serial number, not a string. That is what lets Excel sort and
+    // filter the column by date instead of alphabetically by text.
+    check(alisher[iSana].type === 'n' && Number(alisher[iSana].value) > 40000 && Number(alisher[iSana].value) < 60000,
+      'P19.6 the date is an Excel serial, not a formatted string', `type=${alisher[iSana].type} value=${alisher[iSana].value}`);
+    check(debts.rows.every((row) => row[iQarz].type === 'n' && row[iPaid].type === 'n' && row[iQolgan].type === 'n'),
+      'P19.6 every amount on every row is numeric, not just the row under test');
+    const stylesXml = xl.allText();
+    check(/yyyy/i.test(stylesXml), 'P19.6 a date format is applied, so the serial renders as a readable date');
+    check(/#,##0/.test(stylesXml), 'P19.6 a thousands-separated numeric format is applied');
+    const pays = xl.sheet("To'lovlar");
+    const iPay = pays.headers.indexOf("To'lov summasi");
+    check(pays.rows.every((row) => row[iPay].type === 'n'), 'P19.6 every payment amount is numeric');
+  }
+
+  group('P19.7 A formula-looking cell is neutralised');
+  if (xl) {
+    // "=cmd|calc" is a debtor's real name in this fixture (P16.6). Opened in Excel
+    // it would execute, so the sheet must carry it as inert text.
+    const debts = xl.sheet('Qarzlar');
+    const iIsm = debts.headers.indexOf('F.I.Sh.');
+    const evil = debts.rows.find((row) => String(row[iIsm].value).includes('cmd|calc'));
+    check(!!evil, 'P19.7 the formula-looking name is present as data', `names=${debts.rows.map((x) => x[iIsm].value).join('|')}`);
+    check(!String(evil[iIsm].value).startsWith('='), 'P19.7 it no longer starts with =, so no cell is a formula', `value=${evil[iIsm].value}`);
+    check(evil[iIsm].type !== 'n', 'P19.7 it is carried as text, not as a number or a formula', `type=${evil[iIsm].type}`);
+    check(!/<f[ >\/]/.test(xl.allText()), 'P19.7 the package contains no formula element at all');
+    check(!/"=cmd|calc"/.test(xl.allText()), 'P19.7 the raw =cmd sequence is not stored in the package');
+  }
+
+  group('P19.8 No secret reaches the workbook');
+  if (xl) {
+    const txt = xl.allText();
+    check(!!DEBT_PASS_KEY && !txt.includes(DEBT_PASS_KEY), 'P19.8 the workbook never contains the purge pass key');
+    check(!txt.includes('password'), 'P19.8 no password material is in the workbook');
+    check(!txt.includes('postgres'), 'P19.8 no database URL material is in the workbook');
+    check(!txt.includes('X-Debt-Pass-Key'), 'P19.8 no request header name leaks in');
+  }
+
+  group('P19.9 The export honours the filters on screen');
+  // Two debts whose figures are known exactly, so P19.12 can total them by hand:
+  // 400000 with nothing paid, and 250000 with 100000 already paid.
+  const karakolA = (await dsa.post('/api/admin/debts', {
+    full_name: 'Karakol Security', phone: '+998906660001', service: 'Moy', debt_amount: 400000,
+  })).data.debt;
+  const karakolB = (await dsa.post('/api/admin/debts', {
+    full_name: 'Karakol Security', phone: '+998906660002', service: 'Filtr', debt_amount: 250000, paid_amount: 100000,
+  })).data.debt;
+  check(!!karakolA && !!karakolB, 'P19.9 the search fixture is in place');
+
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx?filter=unpaid');
+  try {
+    const s = readXlsx(r.buf).sheet('Qarzlar');
+    const iQolgan = s.headers.indexOf('Qolgan summa');
+    check(s.rows.length > 0 && s.rows.every((row) => Number(row[iQolgan].value) > 0),
+      'P19.9 ?filter=unpaid exports only debts with an outstanding balance', `n=${s.rows.length}`);
+  } catch (e) { check(false, 'P19.9 ?filter=unpaid parses', String(e && e.message)); }
+
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx?q=Karakol');
+  try {
+    const s = readXlsx(r.buf).sheet('Qarzlar');
+    const iIsm = s.headers.indexOf('F.I.Sh.');
+    check(s.rows.length === 2 && s.rows.every((row) => row[iIsm].value === 'Karakol Security'),
+      'P19.9 ?q= exports only the matching debts, and nothing else', `n=${s.rows.length}`);
+  } catch (e) { check(false, 'P19.9 ?q= parses', String(e && e.message)); }
+
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx?sort=largest');
+  try {
+    const s = readXlsx(r.buf).sheet('Qarzlar');
+    const vals = s.rows.map((row) => Number(row[s.headers.indexOf('Qarz summasi')].value));
+    check(vals.every((v, i) => i === 0 || vals[i - 1] >= v), 'P19.9 ?sort=largest exports in descending order');
+  } catch (e) { check(false, 'P19.9 ?sort=largest parses', String(e && e.message)); }
+
+  // An unknown filter must not be interpolated, and must fall back to the default
+  // view exactly as the list does.
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx?filter=%27%3B+DROP+TABLE+debts%3B--');
+  check(r.status === 200, 'P19.9 an unknown filter value is ignored, not interpolated', `status=${r.status}`);
+  try { readXlsx(r.buf); check(true, 'P19.9 and the ledger is still there to export'); }
+  catch (e) { check(false, 'P19.9 and the ledger is still there to export', String(e && e.message)); }
+
+  group('P19.10 Pagination does not silently truncate the export');
+  // 30 rows is past the 20-row default page. An export that honoured the page size
+  // would hand back 20 and quietly lose 10 -- the failure mode worth blocking.
+  for (let i = 0; i < 30; i++) {
+    await dsa.post('/api/admin/debts', {
+      full_name: `Bulk Debtor ${String(i).padStart(2, '0')}`,
+      phone: `+99897${String(100000 + i)}`,
+      service: 'Moy',
+      debt_amount: 1000 + i,
+    });
+  }
+  const totalNow = (await dsa.get('/api/admin/debts?per_page=100')).data.pagination.total;
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx?q=Bulk+Debtor');
+  try {
+    const s = readXlsx(r.buf).sheet('Qarzlar');
+    check(s.rows.length === 30, 'P19.10 all matching debts are exported, not just the first page', `n=${s.rows.length}`);
+    check(totalNow >= 30, 'P19.10 the ledger really does hold more rows than one page', `total=${totalNow}`);
+  } catch (e) { check(false, 'P19.10 the wide export parses', String(e && e.message)); }
+
+  group('P19.11 The export stays admin-only');
+  for (const p of ['/api/admin/debts/export.xlsx', '/api/admin/debts/export.xlsx?filter=unpaid']) {
+    const anonRes = await anonD.req('GET', p);
+    check(anonRes.status === 401, `P19.11 unauthenticated ${p} is refused`, `status=${anonRes.status}`);
+    check(anonRes.buf.length === 0 || !String(anonRes.headers.get('content-type') || '').includes('spreadsheetml'),
+      `P19.11 and no workbook leaks in the refusal for ${p}`, `type=${anonRes.headers.get('content-type')}`);
+  }
+  const masterXlsx = await dm1.req('GET', '/api/admin/debts/export.xlsx');
+  check(masterXlsx.status === 200, 'P19.11 a logged-in master may export, same as the ledger itself', `status=${masterXlsx.status}`);
+
+  group('P19.12 The summary reports the exported rows, not the whole ledger');
+  try {
+    // The filter returns three known debts, so the totals are computable by hand.
+    r = await dsa.req('GET', '/api/admin/debts/export.xlsx?q=Karakol');
+    const s = readXlsx(r.buf).sheet('Qarzlar');
+    const [iQarz, iPaid, iQolgan] = ['Qarz summasi', "To'langan summa", 'Qolgan summa'].map((h) => s.headers.indexOf(h));
+    check(s.rows.length === 2, 'P19.12 the search fixture is exactly two debts wide', `n=${s.rows.length}`);
+    const expectDebt = s.rows.reduce((a, row) => a + Number(row[iQarz].value), 0);
+    const expectPaid = s.rows.reduce((a, row) => a + Number(row[iPaid].value), 0);
+    const expectLeft = s.rows.reduce((a, row) => a + Number(row[iQolgan].value), 0);
+    // Each summary row holds a label in one column and a figure in another, so the
+    // figure is found as the row's only numeric cell rather than by column name.
+    const summaryValue = (needle) => {
+      const row = s.allRows.find((x) => x.cells.some((c) => String(c.value || '').toLowerCase().includes(needle)));
+      if (!row) return NaN;
+      const nums = row.cells.filter((c) => c && c.value !== null && c.value !== '' && !Number.isNaN(Number(c.value)));
+      return nums.length === 1 ? Number(nums[0].value) : NaN;
+    };
+    const inSheet = xl && xl.sheet('Qarzlar').allRows.length;
+    check(inSheet > 0, 'P19.12 the summary rows are laid out below the table', `n=${inSheet}`);
+    check(summaryValue('jami qarz') === expectDebt, 'P19.12 the total debt matches the rows in the file', `${summaryValue('jami qarz')} vs ${expectDebt}`);
+    check(summaryValue("jami to'langan") === expectPaid, "P19.12 the total paid matches the file", `${summaryValue("jami to'langan")} vs ${expectPaid}`);
+    check(summaryValue('jami qoldiq') === expectLeft, 'P19.12 the total remaining matches the file', `${summaryValue('jami qoldiq')} vs ${expectLeft}`);
+  } catch (e) { check(false, 'P19.12 the summary can be located and compared', String(e && e.message)); }
+
+  group('P19.13 Cost does not scale with the number of debts');
+  // 30+ rows already exist, and the previous group left an export in hand. A
+  // per-row lookup loop is the only way this gets slow; a fixed query count sails
+  // under the budget.
+  const t0 = Date.now();
+  r = await dsa.req('GET', '/api/admin/debts/export.xlsx');
+  const exportMs = Date.now() - t0;
+  check(r.status === 200, 'P19.13 the large export succeeds', `status=${r.status}`);
+  check(exportMs < 8000, 'P19.13 exporting the whole ledger stays well inside the N+1 budget', `ms=${exportMs} total=${totalNow}`);
+
+  group('P19.14 The legacy CSV endpoint still works, minus the address');
+  r = await dsa.req('GET', '/api/admin/debts/export.csv');
+  const legacyCsv = r.buf.toString('utf8');
+  check(r.status === 200 && (r.headers.get('content-type') || '').includes('text/csv'),
+    'P19.14 the CSV endpoint is still served for anything already using it', `status=${r.status}`);
+  check(!/Manzil/i.test(legacyCsv.split('\r\n')[0]), 'P19.14 its header no longer has the address column', legacyCsv.split('\r\n')[0]);
+  check(legacyCsv.includes("'=cmd|calc"), 'P19.14 it keeps neutralising a formula-looking cell');
+
+  group('P19.15 The retired field cannot be reached through the API');
+  r = await dsa.get('/api/admin/debts');
+  check(!JSON.stringify(r.data).includes('"address"'), 'P19.15 the list response contains no address field');
+  r = await dsa.get(`/api/admin/debts/${dAli.id}`);
+  check(!JSON.stringify(r.data).includes('"address"'), 'P19.15 the detail response contains no address field');
+  check(r.data.debt.remaining_amount === 0, 'P19.15 and the rest of the detail payload is intact', `remaining=${r.data.debt && r.data.debt.remaining_amount}`);
+  // A legacy client that still sends the field must be served, not rejected, and
+  // the value must not be stored.
+  r = await dsa.post('/api/admin/debts', {
+    full_name: 'Legacy Client', phone: '+998905550001',
+    address: 'Toshkent, Chilanzar', service: 'Moy', debt_amount: 12345,
+  });
+  check(r.status === 201, 'P19.15 an older client still sending address is accepted, not broken', `status=${r.status}`);
+  check(!JSON.stringify(r.data).includes('address'), 'P19.15 and the submitted value is not echoed back');
+  const legacyId = r.data.debt.id;
+  check(!JSON.stringify((await dsa.get(`/api/admin/debts/${legacyId}`)).data).includes('address'), 'P19.15 and it is not returned on a later read');
+  check(!readXlsx((await dsa.req('GET', '/api/admin/debts/export.xlsx?q=Legacy+Client')).buf).allText().includes('Chilanzar'),
+    'P19.15 and it never reaches the export');
+  // Editing must not blank out a value already on an old row either.
+  r = await dsa.patch(`/api/admin/debts/${dAli.id}`, { address: 'Yangi manzil', service: 'Moy algebrashtirish' });
+  check(r.status === 200 && !JSON.stringify(r.data).includes('address'), 'P19.15 an edit carrying the old field still succeeds and ignores it', `status=${r.status}`);
+  check((await dsa.get(`/api/admin/debts/${dAli.id}`)).status === 200, 'P19.15 debts created before the change are still fully readable');
+
+  group('P19.16 The retired column is still in the schema, and still NOT NULL');
+  const schemaDb = legacyClient(PG_DB);
+  await schemaDb.connect();
+  try {
+    const cols = await schemaDb.query(
+      "SELECT column_name, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'debts' AND column_name = 'address'"
+    );
+    const col = cols.rows[0];
+    check(!!col, 'P19.16 the address column still exists, so existing data and old builds keep working');
+    check(col && col.is_nullable === 'NO', 'P19.16 and it is still NOT NULL, unchanged', `nullable=${col && col.is_nullable}`);
+    check(col && String(col.column_default || '').includes("''"), 'P19.16 and it has a default, so an insert that omits it still succeeds', `default=${col && col.column_default}`);
+    // The guarantee that matters for a ledger: a debt inserted straight into SQL,
+    // with no API and therefore no empty string, still lands.
+    const raw = await schemaDb.query(
+      `INSERT INTO debts (full_name, phone, service, debt_amount, paid_amount, status)
+       VALUES ('Sql Insert', '+998977770001', 'Moy', 1000, 0, 'unpaid') RETURNING id`
+    );
+    check(raw.rowCount === 1, 'P19.16 a raw SQL insert that omits the column still succeeds, thanks to the default');
+    check((await dsa.get(`/api/admin/debts/${raw.rows[0].id}`)).status === 200, 'P19.16 and that row is immediately readable through the API');
+    // The ledger's history is not rewritten. A row that already carries an address
+    // -- one written before this change, or restored from a backup -- keeps its
+    // stored value and its audit metadata; the app simply stops showing it.
+    const withAddress = await schemaDb.query(
+      `INSERT INTO debts (full_name, phone, address, service, debt_amount, paid_amount, status)
+       VALUES ('Legacy Row', '+998977770002', 'Buxoro', 'Moy', 2000, 0, 'unpaid') RETURNING id`
+    );
+    const kept = await schemaDb.query(
+      `INSERT INTO debt_audit_logs (debt_id, action, admin_name, metadata)
+       VALUES ($1, 'created', 'admin', '{"full_name":"Legacy Row","address":"Buxoro"}') RETURNING id`,
+      [withAddress.rows[0].id]
+    );
+    const stillThere = await schemaDb.query(
+      'SELECT address FROM debts WHERE id = $1', [withAddress.rows[0].id]
+    );
+    check(stillThere.rows[0].address === 'Buxoro', 'P19.16 a pre-existing address value is preserved, not blanked by the change', `address=${stillThere.rows[0].address}`);
+    const metaKept = await schemaDb.query('SELECT metadata FROM debt_audit_logs WHERE id = $1', [kept.rows[0].id]);
+    check(String(metaKept.rows[0].metadata).includes('Buxoro'), 'P19.16 existing audit metadata is left verbatim, history is never rewritten', `metadata=${metaKept.rows[0].metadata}`);
+    check(!(await dsa.req('GET', '/api/admin/debts/export.xlsx?q=Legacy+Row')).buf.includes('Buxoro'),
+      'P19.16 while a stored address is neither returned nor exported');
+    // A newly audited row, by contrast, does not collect the field any more.
+    const fresh = await dsa.post('/api/admin/debts', { full_name: 'Fresh Row', phone: '+998977770003', service: 'Moy', debt_amount: 100 });
+    const freshMeta = await schemaDb.query(
+      'SELECT metadata FROM debt_audit_logs WHERE debt_id = $1 ORDER BY id DESC LIMIT 1', [fresh.data.debt.id]
+    );
+    check(!String(freshMeta.rows[0].metadata).includes('address'), 'P19.16 new audit rows no longer record the retired field', `metadata=${freshMeta.rows[0].metadata}`);
+  } catch (e) { check(false, 'P19.16 the schema can be inspected', String(e && e.message)); }
+  await schemaDb.end();
 
   // =========================================================================
   // P17. Oil and filter inventory (Moy va filtrlar ombori)

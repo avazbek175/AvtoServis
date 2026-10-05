@@ -109,7 +109,7 @@ export default function DebtLedger() {
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
-          <CsvExportButton onDone={load} />
+          <ExcelExportButton filter={filter} sort={sort} search={search} onError={setError} />
           <button type="button" onClick={() => setAddOpen(true)} className="btn-primary flex items-center gap-2 !py-2.5 text-sm">
             <Icon name="pluss" size={16} /> Qarz qo'shish
           </button>
@@ -143,7 +143,7 @@ export default function DebtLedger() {
               className="field"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Ism, telefon, manzil yoki xizmat"
+              placeholder="Ism, telefon yoki xizmat"
             />
           </div>
           <div>
@@ -195,7 +195,6 @@ export default function DebtLedger() {
                       <tr key={d.id} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${meta.row} ${archived ? 'opacity-60' : ''}`}>
                         <td className="px-4 py-3">
                           <div className="font-semibold text-white">{d.full_name}</div>
-                          <div className="text-xs text-white/40">{d.address}</div>
                         </td>
                         <td className="px-4 py-3 text-white/70">{d.phone}</td>
                         <td className="px-4 py-3 text-white/70">{d.service}</td>
@@ -233,7 +232,7 @@ export default function DebtLedger() {
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="font-bold">{d.full_name}</div>
-                      <div className="text-xs text-white/45">{d.phone} · {d.address}</div>
+                      <div className="text-xs text-white/45">{d.phone}</div>
                       <div className="mt-1 text-xs text-white/60">{d.service}</div>
                     </div>
                     <Badge kind={archived ? 'default' : meta.badge}>{archived ? 'Arxiv' : meta.label}</Badge>
@@ -301,56 +300,62 @@ function RowActions({ debt, archived, onPay, onHistory, onDelete }) {
 }
 
 /**
- * CSV download via fetch + blob.
+ * Excel (.xlsx) download via fetch + blob.
  *
  * A plain <a href> would work too, but the endpoint is session-authenticated, so
  * the cookie has to travel with the request; fetch does that and lets errors
  * surface as a message instead of a downloaded file full of HTML.
+ *
+ * The current search and filter are forwarded, so the workbook holds the rows the
+ * operator is looking at rather than the whole ledger. Sorting is sent too, which
+ * costs nothing and keeps the sheet in the order on screen.
+ *
+ * Nothing is re-fetched afterwards: an export is a read, so the list on screen is
+ * already correct and a reload would only flash.
  */
-function CsvExportButton({ onDone }) {
+function ExcelExportButton({ filter, sort, search, onError }) {
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
 
   async function download() {
     setBusy(true);
-    setErr('');
+    if (onError) onError('');
     try {
-      const res = await fetch('/api/admin/debts/export.csv', { credentials: 'include' });
-      if (!res.ok) throw new Error('Eksport bajarilmadi');
+      const params = new URLSearchParams({ filter, sort });
+      if (search) params.set('q', search);
+      const res = await fetch(`/api/admin/debts/export.xlsx?${params.toString()}`, {
+        credentials: 'include',
+      });
+      if (!res.ok) throw new Error('Excel faylini yaratishda xatolik yuz berdi.');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'qarz-daftari.csv';
+      a.download = `qarz-daftari-${new Date().toISOString().slice(0, 10)}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      if (onDone) onDone();
     } catch (e) {
-      setErr(e.message);
+      if (onError) onError(e.message || 'Excel faylini yaratishda xatolik yuz berdi.');
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="flex items-center gap-2">
-      <button type="button" onClick={download} disabled={busy} className="btn-outline flex items-center gap-2 !py-2.5 text-sm">
-        <Icon name="document" size={16} /> {busy ? 'Yuklanmoqda...' : 'CSV eksport'}
-      </button>
-      {err && <span className="text-xs text-red-300">{err}</span>}
-    </div>
+    <button type="button" onClick={download} disabled={busy} className="btn-outline flex items-center gap-2 !py-2.5 text-sm">
+      <Icon name="document" size={16} /> {busy ? 'Excel tayyorlanmoqda...' : 'Excel eksport'}
+    </button>
   );
 }
 
 function AddDebtModal({ open, onClose, onSaved }) {
-  const [form, setForm] = useState({ full_name: '', phone: '', address: '', service: '', debt_amount: '', paid_amount: '', description: '' });
+  const [form, setForm] = useState({ full_name: '', phone: '', service: '', debt_amount: '', paid_amount: '', description: '' });
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (open) { setForm({ full_name: '', phone: '', address: '', service: '', debt_amount: '', paid_amount: '', description: '' }); setMsg(null); }
+    if (open) { setForm({ full_name: '', phone: '', service: '', debt_amount: '', paid_amount: '', description: '' }); setMsg(null); }
   }, [open]);
 
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
@@ -385,10 +390,6 @@ function AddDebtModal({ open, onClose, onSaved }) {
           <div>
             <label className="label">Telefon *</label>
             <input className="field" value={form.phone} onChange={set('phone')} placeholder="+998 90 123 45 67" required />
-          </div>
-          <div>
-            <label className="label">Yashash joyi *</label>
-            <input className="field" value={form.address} onChange={set('address')} placeholder="Urganch, Xorazm" required />
           </div>
           <div>
             <label className="label">Ko'rsatilgan xizmat *</label>

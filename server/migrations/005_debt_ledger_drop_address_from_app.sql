@@ -1,0 +1,24 @@
+-- 005_debt_ledger_drop_address_from_app.sql
+-- The debtor's home address is retired from the product: it is no longer asked
+-- for in the forms, never returned by the API, and never exported.
+--
+-- Durability rules for this file, same as every other migration here:
+--   * there is no DROP, TRUNCATE or DELETE;
+--   * the `address` COLUMN ITSELF IS KEPT, so the schema stays compatible with
+--     the data that is already in production and with any older build of the app
+--     that still sends the field (it is accepted and ignored);
+--   * rows already written are not touched, so an existing ledger keeps its
+--     history exactly as it is.
+--
+-- The one statement below gives the column a default. It exists because
+-- `debts.address` is NOT NULL: a new row has to supply something, and the only
+-- value a new row may hold is the empty string. Setting it here means any INSERT
+-- path -- the API today, a future import, a manual fix in psql -- can leave the
+-- column out entirely instead of being forced to invent a value. An existing
+-- NOT NULL constraint with no default would otherwise turn "we stopped asking for
+-- an address" into a 500 on create.
+--
+-- `ALTER COLUMN ... SET DEFAULT` changes only the default, keeps the type, keeps
+-- the NOT NULL constraint and every stored value, and is safe to run twice.
+
+ALTER TABLE debts ALTER COLUMN address SET DEFAULT '';

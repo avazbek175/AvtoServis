@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { db } = require('../db');
 const auth = require('../auth');
 const rateLimit = require('../rateLimit');
+const { buildDebtWorkbook } = require('../debtExcel');
 
 const router = require('../asyncRoute').wrapRouter(express.Router());
 
@@ -59,32 +60,39 @@ function statusFor(debtAmount, paidAmount) {
 // Search / filter / sort / pagination
 // ---------------------------------------------------------------------------
 
-/** Escapes LIKE wildcards so a search for "100%" is a literal search. */
+/**
+ * Escapes LIKE wildcards so a search for "100%" is a literal search.
+ */
 function likeTerm(value) {
   return `%${String(value).replace(/[\\%_]/g, (m) => '\\' + m)}%`;
 }
 
 // Whitelisted ORDER BY. A raw value from the query string is never interpolated.
+// Aliased on `d` because the export sorts the same expression against a JOIN,
+// where a bare created_at would be ambiguous against debt_payments.
 const SORTS = {
-  newest: 'created_at DESC, id DESC',
-  oldest: 'created_at ASC, id ASC',
-  largest: 'debt_amount DESC, id DESC',
-  remaining: 'remaining_amount DESC, id DESC',
+  newest: 'd.created_at DESC, d.id DESC',
+  oldest: 'd.created_at ASC, d.id ASC',
+  largest: 'd.debt_amount DESC, d.id DESC',
+  remaining: 'd.remaining_amount DESC, d.id DESC',
 };
 
 const FILTERS = {
   all: null,
   // "unpaid" means nothing has been paid yet. Partially-paid rows are a separate
   // filter so the counts stay mutually exclusive and the cards add up.
-  unpaid: "status = 'unpaid' AND remaining_amount > 0",
-  partially_paid: "status = 'partially_paid' AND remaining_amount > 0",
-  paid: "status = 'paid'",
+  unpaid: "d.status = 'unpaid' AND d.remaining_amount > 0",
+  partially_paid: "d.status = 'partially_paid' AND d.remaining_amount > 0",
+  paid: "d.status = 'paid'",
   archive: null, // handled separately: deleted_at IS NOT NULL
 };
 
 function listQuery(req) {
-  const q = text(req.query.q, 'q', { max: 120 });
-  const filterKey = FILTERS[req.query.filter] !== undefined ? req.query.filter : 'all';
+  const q = text(req.query.q ?? req.query.search, 'q', { max: 120 });
+  // "status" is accepted as an alias for "filter" so an export link can be built
+  // by hand (?status=unpaid) without having to know the internal filter names.
+  const filterKeyRaw = req.query.filter ?? req.query.status;
+  const filterKey = FILTERS[filterKeyRaw] !== undefined ? filterKeyRaw : 'all';
   const filter = FILTERS[filterKey];
   const archived = filterKey === 'archive';
 
@@ -92,18 +100,20 @@ function listQuery(req) {
   const perPage = Math.min(100, Math.max(5, Number.parseInt(req.query.per_page) || 20));
   const orderBy = SORTS[req.query.sort] || SORTS.newest;
 
-  const where = [archived ? 'deleted_at IS NOT NULL' : 'deleted_at IS NULL'];
+  const where = [archived ? 'd.deleted_at IS NOT NULL' : 'd.deleted_at IS NULL'];
   const params = [];
 
   if (q) {
     const term = likeTerm(q);
-    // Name, phone, address and service are all searchable, as required.
-    where.push("(full_name ILIKE ? ESCAPE '\\' OR phone ILIKE ? ESCAPE '\\' OR address ILIKE ? ESCAPE '\\' OR service ILIKE ? ESCAPE '\\')");
-    params.push(term, term, term, term);
+    // Only the fields the operator can actually see. The home address used to be
+    // searchable; it is no longer collected, displayed or exported, so matching on
+    // it would let a legacy address surface rows the UI gives no way to explain.
+    where.push("(d.full_name ILIKE ? ESCAPE '\\' OR d.phone ILIKE ? ESCAPE '\\' OR d.service ILIKE ? ESCAPE '\\')");
+    params.push(term, term, term);
   }
   if (filter) where.push(filter);
 
-  return { where: where.join(' AND '), params, page, perPage, orderBy, archived };
+  return { where: where.join(' AND '), params, page, perPage, orderBy, archived, filterKey };
 }
 
 // ---------------------------------------------------------------------------
@@ -141,12 +151,18 @@ async function auditStandalone(req, debtId, action, metadata) {
   }
 }
 
-/** Snapshot of the debtor's identifying fields, for the audit trail. */
+/**
+ * Snapshot of the debtor's identifying fields, for the audit trail.
+ *
+ * The home address is no longer part of this snapshot. It is absent from every
+ * field the API collects or returns, so recording it on new audit rows would only
+ * preserve data the product has stopped keeping. Rows already in the table are
+ * historical facts and are left exactly as they are.
+ */
 function snapshot(d) {
   return {
     full_name: d.full_name,
     phone: d.phone,
-    address: d.address,
     service: d.service,
     debt_amount: Number(d.debt_amount),
     paid_amount: Number(d.paid_amount),
@@ -155,7 +171,16 @@ function snapshot(d) {
   };
 }
 
-const DEBT_FIELDS = 'id, full_name, phone, address, service, description, debt_amount, paid_amount, remaining_amount, status, created_at, updated_at, deleted_at';
+/**
+ * The columns every read path returns.
+ *
+ * `address` is absent on purpose: the column still exists in the table (see
+ * migration 005) and older rows keep their value, but it is not selected, so it
+ * cannot leak through the list, the detail endpoint, the statistics or either
+ * export. Dropping it here rather than from each query is what makes that
+ * guarantee hold for every caller at once.
+ */
+const DEBT_FIELDS = 'id, full_name, phone, service, description, debt_amount, paid_amount, remaining_amount, status, created_at, updated_at, deleted_at';
 
 // ---------------------------------------------------------------------------
 // DELETE pass key
@@ -229,19 +254,26 @@ function archivedOnly() {
 // Routes
 // ---------------------------------------------------------------------------
 
-// Declared before "/:id" so the literal path wins over the id pattern.
+/**
+ * Legacy CSV export.
+ *
+ * Kept, and still reachable, for backward compatibility with anything already
+ * pointing at it -- a saved bookmark, a report that runs on a schedule, an older
+ * build of the app. The UI no longer offers it; the Excel workbook at
+ * "/export.xlsx" is what an operator downloads.
+ *
+ * `address` is gone from the output for the same reason it is gone from the API.
+ */
 router.get('/export.csv', async (req, res) => {
+  const { where, params } = listQuery(req);
   const rows = await db
-    .prepare(
-      `SELECT ${DEBT_FIELDS} FROM debts WHERE deleted_at IS NULL ORDER BY created_at DESC`
-    )
-    .all();
+    .prepare(`SELECT ${DEBT_FIELDS} FROM debts d WHERE ${where} ORDER BY d.created_at DESC, d.id DESC`)
+    .all(...params);
 
-  const header = ['Ism', 'Telefon', 'Manzil', 'Xizmat', 'Qarz', 'To\'langan', 'Qolgan', 'Holat', 'Sana'];
+  const header = ['Ism', 'Telefon', 'Xizmat', 'Qarz', 'To\'langan', 'Qolgan', 'Holat', 'Sana'];
   const body = rows.map((d) => [
     d.full_name,
     d.phone,
-    d.address,
     d.service,
     d.debt_amount,
     d.paid_amount,
@@ -258,17 +290,115 @@ router.get('/export.csv', async (req, res) => {
   res.send([header, ...body].map((row) => row.map(csvCell).join(',')).join('\r\n'));
 });
 
+/**
+ * Excel (.xlsx) export of the whole ledger: debts, payments and audit rows.
+ *
+ * Three sheets, because they answer three different questions and mixing them
+ * would make the sheet unusable for the first two: what is owed (Qarzlar), what
+ * has been received (To'lovlar) and who did what (Audit).
+ *
+ * It exports what the operator is currently looking at. The same `listQuery`
+ * helper the list view uses decides the rows, so `?filter=unpaid&sort=largest`
+ * or `?q=99890123` produce a file of exactly those debts. Pagination is
+ * deliberately ignored: an export that silently stops at 20 rows is worse than
+ * useless on a ledger.
+ *
+ * Cost: three queries plus one aggregate, regardless of how many debts there are.
+ * The payment and audit sheets JOIN debts and reuse the identical WHERE clause, so
+ * no debt id is fetched twice and there is no query per row.
+ *
+ * Auth: this router applies auth.authenticate to itself, so the endpoint is
+ * unreachable without an admin session. It deliberately adds no extra permission
+ * scope: the debt ledger has never gated a role, and adding one now would lock
+ * out admins who can already see every debt on screen.
+ */
+router.get('/export.xlsx', async (req, res) => {
+  const { where, params, orderBy, filterKey } = listQuery(req);
+
+  const debts = await db
+    .prepare(`SELECT ${DEBT_FIELDS} FROM debts d WHERE ${where} ORDER BY ${orderBy}`)
+    .all(...params);
+
+  // One query for the whole payment history, filtered by the same WHERE, instead
+  // of a lookup per debt. The debt's name and phone ride along on the join so the
+  // sheet is readable without the reader cross-referencing sheet one.
+  const payments = await db
+    .prepare(
+      `SELECT p.id, p.debt_id, p.amount, p.note, p.created_at, p.created_by,
+              d.full_name, d.phone, u.full_name AS created_by_name
+         FROM debt_payments p
+         JOIN debts d ON d.id = p.debt_id
+         LEFT JOIN users u ON u.id = p.created_by
+        WHERE ${where}
+        ORDER BY p.created_at DESC, p.id DESC`
+    )
+    .all(...params);
+
+  // debt_audit_logs.debt_id has no foreign key on purpose (an audit row outlives
+  // the debt it describes), so the join also carries the rows left behind by a
+  // purge -- those are attached to no debt any more and are therefore not part of
+  // "the debts currently in view".
+  const auditLogs = await db
+    .prepare(
+      `SELECT a.id, a.debt_id, a.action, a.admin_name, a.metadata, a.created_at
+         FROM debt_audit_logs a
+         JOIN debts d ON d.id = a.debt_id
+        WHERE ${where}
+        ORDER BY a.created_at DESC, a.id DESC`
+    )
+    .all(...params);
+
+  // The summary must describe the file, not the ledger, so it aggregates over the
+  // same WHERE rather than reading the totals endpoint.
+  const totals = await db
+    .prepare(
+      `SELECT COALESCE(SUM(debt_amount), 0)                   AS total_debt,
+              COALESCE(SUM(paid_amount), 0)                   AS total_paid,
+              COALESCE(SUM(GREATEST(remaining_amount, 0)), 0) AS total_remaining,
+              COUNT(*)                                       AS total_count
+         FROM debts d WHERE ${where}`
+    )
+    .get(...params);
+
+  const { buffer, counts } = await buildDebtWorkbook({
+    debts: debts.map((d) => ({ ...d, status_label: STATUS_UZ[d.status] || d.status })),
+    payments,
+    auditLogs,
+    totals: {
+      total_debt: Number(totals.total_debt),
+      total_paid: Number(totals.total_paid),
+      total_remaining: Number(totals.total_remaining),
+    },
+  });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="qarz-daftari-${todayStamp()}.xlsx"`);
+  res.setHeader('Cache-Control', 'no-store');
+  // XLSX is a ZIP, so a proxy must not try to re-compress it.
+  res.setHeader('Content-Length', String(buffer.length));
+  res.setHeader('X-Export-Rows', `${counts.debts}/${counts.payments}/${counts.auditLogs}`);
+  res.setHeader('X-Export-Filter', String(filterKey));
+  res.end(buffer);
+});
+
 const STATUS_UZ = { unpaid: "To'lanmagan", partially_paid: "Qisman to'langan", paid: "To'langan" };
 
 function appNow() {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 }
 
+/** "YYYY-MM-DD" for the download filename. */
+function todayStamp() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 /**
- * Spreadsheet formula injection guard.
+ * Spreadsheet formula injection guard for the legacy CSV export.
  *
- * A cell starting with = + - @ @ is executed by Excel/Sheets when the file is
+ * A cell starting with = + - @ is executed by Excel/Sheets when the file is
  * opened, so a debtor's name of "=cmd|..." would run on the operator's machine.
+ * The .xlsx workbook applies the equivalent guard in debtExcel.js, which is where
+ * new code should come from; this stays because the CSV endpoint stays.
  */
 function csvCell(value) {
   let v = String(value == null ? '' : value);
@@ -312,10 +442,10 @@ router.get('/', async (req, res) => {
   const { where, params, page, perPage, orderBy, archived } = listQuery(req);
 
   const rows = await db
-    .prepare(`SELECT ${DEBT_FIELDS} FROM debts WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
+    .prepare(`SELECT ${DEBT_FIELDS} FROM debts d WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
     .all([...params, perPage, (page - 1) * perPage]);
   const total = Number(
-    (await db.prepare(`SELECT COUNT(*) c FROM debts WHERE ${where}`).get(...params)).c
+    (await db.prepare(`SELECT COUNT(*) c FROM debts d WHERE ${where}`).get(...params)).c
   );
 
   res.json({
@@ -329,10 +459,13 @@ router.post('/', async (req, res) => {
   const body = req.body || {};
   const full_name = text(body.full_name, 'Ism-familiya', { required: true, max: 200 });
   const phone = text(body.phone, 'Telefon', { required: true, max: 60 });
-  const address = text(body.address, 'Yashash joyi', { required: true, max: 300 });
   const service = text(body.service, 'Xizmat', { required: true, max: 300 });
   const description = text(body.description, 'Izoh', { max: 4000 });
 
+  // `address` is accepted and discarded. The field was retired from the product,
+  // but an older client or a bookmarked request may still send it; silently
+  // ignoring it keeps that request working instead of turning it into a 400, and
+  // ignoring it is what stops the value from being stored.
   const debt_amount = parseAmount(body.debt_amount, 'Qarz');
   if (debt_amount <= 0) throw badRequest("Qarz summasi 0 dan katta bo'lishi kerak");
 
@@ -345,12 +478,15 @@ router.post('/', async (req, res) => {
   const status = statusFor(debt_amount, paid_amount);
 
   const debt = await db.transaction(async (t) => {
+    // address is written as an empty string, NOT NULL. The column is kept for
+    // schema compatibility with existing data, and this is the only value a new
+    // row may hold in it. Nothing that the operator typed ever reaches it.
     const created = await t
       .prepare(
         `INSERT INTO debts (full_name, phone, address, service, description, debt_amount, paid_amount, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${DEBT_FIELDS}`
+         VALUES (?, ?, '', ?, ?, ?, ?, ?) RETURNING ${DEBT_FIELDS}`
       )
-      .one(full_name, phone, address, service, description, debt_amount, paid_amount, status);
+      .one(full_name, phone, service, description, debt_amount, paid_amount, status);
 
     // An opening balance that is already paid is recorded in the payment ledger
     // too, so SUM(debt_payments) always reconciles with paid_amount.
@@ -395,10 +531,12 @@ router.patch('/:id', async (req, res) => {
   const body = req.body || {};
   const full_name = 'full_name' in body ? text(body.full_name, 'Ism-familiya', { required: true, max: 200 }) : existing.full_name;
   const phone = 'phone' in body ? text(body.phone, 'Telefon', { required: true, max: 60 }) : existing.phone;
-  const address = 'address' in body ? text(body.address, 'Yashash joyi', { required: true, max: 300 }) : existing.address;
   const service = 'service' in body ? text(body.service, 'Xizmat', { required: true, max: 300 }) : existing.service;
   const description = 'description' in body ? text(body.description, 'Izoh', { max: 4000 }) : existing.description;
 
+  // `address` in the body is ignored, for the same reason as on create. It is also
+  // absent from the UPDATE below, so a value already stored on the row is left
+  // untouched rather than blanked out.
   const debt_amount = 'debt_amount' in body ? parseAmount(body.debt_amount, 'Qarz') : Number(existing.debt_amount);
   if (debt_amount <= 0) throw badRequest("Qarz summasi 0 dan katta bo'lishi kerak");
 
@@ -413,11 +551,11 @@ router.patch('/:id', async (req, res) => {
   const debt = await db.transaction(async (t) => {
     const updated = await t
       .prepare(
-        `UPDATE debts SET full_name = ?, phone = ?, address = ?, service = ?, description = ?,
+        `UPDATE debts SET full_name = ?, phone = ?, service = ?, description = ?,
                           debt_amount = ?, status = ?, updated_at = app_now()
          WHERE id = ? RETURNING ${DEBT_FIELDS}`
       )
-      .one(full_name, phone, address, service, description, debt_amount, status, id);
+      .one(full_name, phone, service, description, debt_amount, status, id);
     await audit(t, req, id, 'updated', { before: snapshot(existing), after: snapshot(updated) });
     return updated;
   });
