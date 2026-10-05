@@ -42,6 +42,8 @@ const paths = {
   camera: 'M4 7h4l2-2h4l2 2h4a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1Z M12 11a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z M17.5 9.5h.01',
   calendar: 'M4 5h16v4H4V5Zm0 6h16v8H4v-8Z M7 3v4M17 3v4',
   money: 'M12 3a9 9 0 1 1 0 18 9 9 0 0 1 0-18Zm-2 5v2h4v2h-4v5h2v-1a3 3 0 0 0 2-2M9 16h6',
+  // Carton / parts box: filters and any warehoused consumable.
+  box: 'M3 8l9-5 9 5v8l-9 5-9-5V8Zm9 5 9-5M12 13v8M3 8l9 5',
 };
 
 export function Icon({ name, size = 24, className = '', strokeWidth = 1.8 }) {

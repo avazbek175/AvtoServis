@@ -6,6 +6,14 @@ const { Pool, types } = require('pg');
 // (COUNT(*) must not become "5" in admin/health responses).
 types.setTypeParser(20, (value) => (value === null ? null : Number(value)));
 
+// numeric (OID 1700) also arrives as a string by default. The inventory ledger
+// stores stock and money in NUMERIC so PostgreSQL does the arithmetic exactly;
+// without this parser those exact values would reach the JSON API as strings
+// ("23.5" instead of 23.5) and every consumer would have to remember to coerce.
+// The widest numeric in the schema is NUMERIC(12,3), i.e. under 10^12, which is
+// exactly representable as a double, so nothing is lost in transport.
+types.setTypeParser(1700, (value) => (value === null ? null : Number(value)));
+
 const connectionString = String(process.env.DATABASE_URL || '').trim();
 
 if (!connectionString) {

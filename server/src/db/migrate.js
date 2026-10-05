@@ -152,6 +152,10 @@ const EXPECTED_COLUMNS = {
   sessions: ['token_id', 'user_id', 'created_at', 'expires_at'],
   work_logs: ['id', 'master_id', 'title', 'customer_name', 'customer_phone', 'car_brand', 'car_model', 'car_number', 'service_type', 'description', 'start_date', 'end_date', 'price', 'status', 'is_public', 'notes', 'created_at', 'updated_at'],
   work_log_images: ['id', 'work_log_id', 'image_path', 'original_filename', 'object_key', 'created_at'],
+  inventory_products: ['id', 'name', 'type', 'brand', 'viscosity', 'unit', 'package_size', 'current_quantity', 'minimum_quantity', 'cost_price', 'is_active', 'created_at', 'updated_at'],
+  inventory_movements: ['id', 'product_id', 'movement_type', 'quantity', 'before_quantity', 'after_quantity', 'reference_type', 'reference_id', 'admin_id', 'note', 'created_at'],
+  service_materials: ['id', 'work_log_id', 'product_id', 'quantity', 'movement_id', 'created_at'],
+  inventory_audit_logs: ['id', 'product_id', 'action', 'admin_id', 'admin_name', 'metadata', 'created_at'],
 };
 
 /**

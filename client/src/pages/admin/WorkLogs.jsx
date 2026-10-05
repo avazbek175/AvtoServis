@@ -301,9 +301,37 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
   const [images, setImages] = useState(initial._images || initial.images || []);
   const [busyImg, setBusyImg] = useState(false);
   const [pending, setPending] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [materials, setMaterials] = useState([]);
+  const [matErr, setMatErr] = useState('');
   const fileRef = useRef(null);
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  useEffect(() => {
+    if (!isSA) return undefined;
+    let alive = true;
+    api.get('/admin/inventory/products?filter=active&per_page=100&sort=name')
+      .then(({ products }) => { if (alive) setProducts(products || []); })
+      .catch(() => { if (alive) setMatErr('Ombor mahsulotlarini yuklab bo‘lmadi'); });
+    return () => { alive = false; };
+  }, []);
+
+  function addMaterial() {
+    const used = materials.map((m) => m.product_id);
+    const next = products.find((p) => p.is_active && !used.includes(p.id));
+    if (!next) { setMatErr('Omborga qo‘shilgan barcha mahsulotlar tanlab olingan'); return; }
+    setMatErr('');
+    setMaterials((m) => [...m, { product_id: next.id, quantity: '', note: '' }]);
+  }
+
+  function setMaterial(i, k, v) {
+    setMaterials((m) => m.map((row, idx) => (idx === i ? { ...row, [k]: v } : row)));
+  }
+
+  function removeMaterial(i) {
+    setMaterials((m) => m.filter((_, idx) => idx !== i));
+  }
 
   function pickFiles(e) {
     const files = Array.from(e.target.files || []);
@@ -318,6 +346,15 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
   async function save(e) {
     e.preventDefault();
     setError('');
+    const lines = [];
+    for (let i = 0; i < materials.length; i++) {
+      const q = Number(String(materials[i].quantity).replace(',', '.'));
+      if (!Number.isFinite(q) || q <= 0) {
+        setError(`Material ${i + 1}: miqdor 0 dan katta bo‘lishi kerak`);
+        return;
+      }
+      lines.push({ product_id: materials[i].product_id, quantity: q, note: materials[i].note.trim() || undefined });
+    }
     setSaving(true);
     try {
       const payload = { ...form };
@@ -331,6 +368,9 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
       if (isEdit) {
         await api.put('/admin/worklogs/' + initial.id, payload);
       } else {
+        // Material harakatlari serverda work log bilan bitta transaction ichida
+        // yoziladi; yetarli stock bo'lmasa butun ish yozuvi rollback bo'ladi.
+        if (lines.length) payload.materials = lines;
         await api.post('/admin/worklogs', payload);
       }
       onSaved();
@@ -441,6 +481,80 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
           <label className="label">Bajarilgan ish tavsifi</label>
           <textarea className="field min-h-[90px]" value={form.description} onChange={set('description')} placeholder="Qanday ishlar bajarildi, qanday qismlar almashtirildi..." />
         </div>
+
+        {!isEdit && isSA && (
+          <div className="rounded-xl border border-white/5 bg-white/[0.03] p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <div>
+                <label className="label !mb-0">Ombor mahsulotlari ({materials.length})</label>
+                <p className="mt-1 text-xs text-white/40">Ishni saqlashda ombor qoldig‘i avtomatik kamayadi</p>
+              </div>
+              <button type="button" onClick={addMaterial} className="btn-outline !py-2 text-xs">
+                <Icon name="box" size={15} /> Qo‘shish
+              </button>
+            </div>
+            {matErr && <Alert>{matErr}</Alert>}
+            {materials.length === 0 ? (
+              <p className="py-2 text-xs text-white/35">Mahsulot tanlanmagan</p>
+            ) : (
+              <div className="space-y-2">
+                {materials.map((m, i) => {
+                  const p = products.find((x) => x.id === m.product_id);
+                  const unit = p ? (p.unit === 'liter' ? 'litr' : 'dona') : '';
+                  const low = p && Number(p.current_quantity) <= 0;
+                  return (
+                    <div key={m.product_id} className="grid gap-2 sm:grid-cols-[1fr_120px_1fr_auto] sm:items-start">
+                      <div className="text-sm text-white/80">
+                        <span className="block truncate">{p ? p.name : `#${m.product_id}`}</span>
+                        {p && (
+                          <span className={`text-xs ${low ? 'text-rose-400' : 'text-white/40'}`}>
+                            Qoldiq: {Number(p.current_quantity).toLocaleString('uz-UZ')} {unit}
+                          </span>
+                        )}
+                      </div>
+                      <div>
+                        <input
+                          type="number" min="0.001" step="0.001" className="field" value={m.quantity}
+                          onChange={(e) => setMaterial(i, 'quantity', e.target.value)}
+                          placeholder={`Miqdor${unit ? ` (${unit})` : ''}`}
+                        />
+                      </div>
+                      <div>
+                        <input className="field" value={m.note} onChange={(e) => setMaterial(i, 'note', e.target.value)} placeholder="Izoh (ixtiyoriy)" />
+                      </div>
+                      <button
+                        type="button" onClick={() => removeMaterial(i)}
+                        className="self-center rounded-lg border border-white/10 px-2.5 py-2 text-xs text-white/60 hover:border-rose-500/40 hover:text-rose-300"
+                        aria-label="Materialni olib tashlash"
+                      >
+                        <Icon name="trash" size={15} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {isSA && Array.isArray(initial.materials) && initial.materials.length > 0 && (
+          <div className="rounded-xl border border-white/5 bg-white/[0.03] p-4">
+            <label className="label !mb-2">Sarflangan mahsulotlar</label>
+            <div className="space-y-1">
+              {initial.materials.map((m, i) => {
+                const p = products.find((x) => x.id === m.product_id);
+                const unit = p ? (p.unit === 'liter' ? 'litr' : 'dona') : '';
+                return (
+                  <div key={i} className="text-xs text-white/60">
+                    {p ? p.name : `#${m.product_id}`} — {Number(m.quantity).toLocaleString('uz-UZ')} {unit}
+                    {m.note ? ` (${m.note})` : ''}
+                  </div>
+                );
+              })}
+            </div>
+            <p className="mt-2 text-xs text-white/35">Harakatlarni tahrirlash ombor sahifasidan bajariladi</p>
+          </div>
+        )}
         <div>
           <label className="label">Qo'shimcha izohlar</label>
           <textarea className="field min-h-[60px]" value={form.notes} onChange={set('notes')} placeholder="Kafolat, keyingi tavsiyalar va h.k." />

@@ -15,6 +15,7 @@ const mediaRouter = require('./routes/media');
 const worklogsRouter = require('./routes/worklogs');
 const workimagesRouter = require('./routes/workimages');
 const debtsRouter = require('./routes/debts').router;
+const inventoryRouter = require('./routes/inventory').router;
 const { createCorsOptions, ConfigurationError } = require('./cors');
 
 const app = express();
@@ -246,6 +247,10 @@ app.use('/api/admin/worklogs', worklogsRouter);
 // Debt ledger. Mounted after auth.authenticate inside the router, so every
 // endpoint requires an admin session; there is no public path to this data.
 app.use('/api/admin/debts', debtsRouter);
+// Oil and filter warehouse. Same rule as the debt ledger: the router applies
+// auth.authenticate to itself, so there is no unauthenticated path to stock
+// levels or purchase costs.
+app.use('/api/admin/inventory', inventoryRouter);
 app.use('/api/workimages', workimagesRouter);
 
 const uploadsDir = require('./paths').uploadsDir;

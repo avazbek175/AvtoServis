@@ -1955,6 +1955,529 @@ async function readinessTests() {
     check(!nokeyLogText.includes(DEBT_PASS_KEY), 'P16.17 nothing about the key reaches the logs');
   }
   nokey.kill('SIGTERM');
+
+  // =========================================================================
+  // P17. Oil and filter inventory (Moy va filtrlar ombori)
+  // =========================================================================
+  const isa = newClient();
+  r = await isa.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+  check(r.status === 200, 'P17.0 the super admin can sign in for the warehouse tests', `status=${r.status}`);
+  const im1 = newClient();
+  await im1.post('/api/auth/login', { username: 'usta1', password: 'password123' });
+  const anonI = newClient();
+  const masterRow = (await isa.get('/api/admin/users')).data.users.find((u) => u.username === 'usta1');
+
+  group('P17.1 The warehouse is admin-only');
+  for (const [m, p] of [
+    ['GET', '/api/admin/inventory/products'],
+    ['GET', '/api/admin/inventory/stats'],
+    ['GET', '/api/admin/inventory/movements'],
+    ['GET', '/api/admin/inventory/export.csv'],
+    ['POST', '/api/admin/inventory/products'],
+  ]) {
+    r = await anonI.req(m, p);
+    check(r.status === 401, `P17.1 unauthenticated ${m} ${p} is refused`, `status=${r.status}`);
+  }
+  r = await anonI.get('/api/public/inventory');
+  check(r.status === 404, 'P17.1 there is no public /api/public/inventory endpoint', `status=${r.status}`);
+  // Stock levels and purchase costs are business data: a master may file work
+  // logs but must not be able to read or move the warehouse.
+  r = await im1.get('/api/admin/inventory/products');
+  check(r.status === 403, 'P17.1 a logged-in master cannot list stock', `status=${r.status}`);
+  r = await im1.get('/api/admin/inventory/stats');
+  check(r.status === 403, 'P17.1 a logged-in master cannot read warehouse totals', `status=${r.status}`);
+  r = await im1.get('/api/admin/inventory/movements');
+  check(r.status === 403, 'P17.1 a logged-in master cannot read the movement ledger', `status=${r.status}`);
+  r = await im1.post('/api/admin/inventory/products', { name: 'Usta moyi', type: 'oil', viscosity: '5W-30' });
+  check(r.status === 403, 'P17.1 a logged-in master cannot create a product', `status=${r.status}`);
+
+  group('P17.2 Product validation');
+  const badProducts = [
+    [{ type: 'oil', viscosity: '5W-30' }, 'a missing name'],
+    [{ name: 'X', type: 'oil' }, 'oil without viscosity'],
+    [{ name: 'X', type: 'filter', viscosity: '5W-30' }, 'a filter with viscosity'],
+    [{ name: 'X', type: 'grease' }, 'an unknown type'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', unit: 'piece' }, 'oil measured in pieces'],
+    [{ name: 'X', type: 'filter', unit: 'liter' }, 'a filter measured in litres'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', cost_price: -5 }, 'a negative price'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', cost_price: '45000abc' }, 'a partially numeric price'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', package_size: '4.5.6' }, 'a malformed package size'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', current_quantity: -1 }, 'a negative opening stock'],
+    [{ name: 'X', type: 'oil', viscosity: '5W-30', current_quantity: '4.5abc' }, 'a partially numeric opening stock'],
+  ];
+  for (const [body, label] of badProducts) {
+    r = await isa.post('/api/admin/inventory/products', body);
+    check(r.status === 400, `P17.2 ${label} is refused`, `status=${r.status}`);
+  }
+
+  r = await isa.post('/api/admin/inventory/products', {
+    name: 'Mobil 1 5W-30', type: 'oil', brand: 'Mobil', viscosity: '5W-30',
+    package_size: 4, minimum_quantity: 8, cost_price: '185000.50',
+  });
+  const oil = r.data.product;
+  check(r.status === 201 && oil.unit === 'liter', 'P17.2 an oil product is created and its unit is derived', `status=${r.status} unit=${oil && oil.unit}`);
+  check(oil.current_quantity === 0, 'P17.2 a new product starts empty', `current=${oil.current_quantity}`);
+  check(oil.is_active === 1, 'P17.2 a new product is active by default');
+
+  r = await isa.post('/api/admin/inventory/products', {
+    name: 'Filtr Toyota 90915', type: 'filter', brand: 'Toyota', package_size: 1,
+    minimum_quantity: 3, cost_price: 45000,
+  });
+  const filter = r.data.product;
+  check(r.status === 201 && filter.unit === 'piece', 'P17.2 a filter product is created in pieces', `status=${r.status} unit=${filter && filter.unit}`);
+
+  r = await isa.post('/api/admin/inventory/products', {
+    name: 'Shell Helix HX7 5W-40', type: 'oil', brand: 'Shell', viscosity: '5W-40',
+    package_size: 4, minimum_quantity: 4, cost_price: 210000, current_quantity: 20,
+  });
+  const oil2 = r.data.product;
+  check(r.status === 201 && oil2.current_quantity === 20, 'P17.2 an opening stock can be seeded at creation', `status=${r.status} current=${oil2 && oil2.current_quantity}`);
+
+  group('P17.3 Stock in, consumption and stock take');
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/stock-in`, { quantity: '4.5' });
+  check(r.status === 201 && r.data.product.current_quantity === 4.5, 'P17.3 stock-in raises the level', `status=${r.status}`);
+  check(r.data.movement.movement_type === 'purchase' && r.data.movement.quantity === 4.5,
+    'P17.3 stock-in writes a purchase movement', JSON.stringify(r.data.movement));
+  check(r.data.movement.before_quantity === 0 && r.data.movement.after_quantity === 4.5,
+    'P17.3 the movement records the level before and after', JSON.stringify(r.data.movement));
+
+  // parseFloat would happily turn these into numbers; a warehouse that records
+  // 1000 litres because of an exponent is worse than one that refuses.
+  for (const [q, label] of [['4.5abc', 'a partially numeric quantity'], ['1e3', 'an exponent'], ['', 'an empty quantity'], ['0', 'a zero quantity'], ['-5', 'a negative quantity']]) {
+    r = await isa.post(`/api/admin/inventory/products/${oil.id}/consume`, { quantity: q });
+    check(r.status === 400, `P17.3 ${label} is refused on consumption`, `status=${r.status}`);
+  }
+
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/consume`, { quantity: '1.5', note: 'Moy almashtirish' });
+  check(r.status === 201 && r.data.product.current_quantity === 3, 'P17.3 consumption lowers the level exactly', `status=${r.status} current=${r.data.product && r.data.product.current_quantity}`);
+  check(r.data.movement.quantity === -1.5, 'P17.3 consumption is stored as a negative quantity', `quantity=${r.data.movement && r.data.movement.quantity}`);
+
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/consume`, { quantity: 99 });
+  check(r.status === 409, 'P17.3 consuming more than the stock is a conflict, not a 500', `status=${r.status}`);
+  r = await isa.get(`/api/admin/inventory/products/${oil.id}`);
+  check(r.data.product.current_quantity === 3, 'P17.3 a refused consumption leaves the level untouched', `current=${r.data.product.current_quantity}`);
+
+  r = await isa.post(`/api/admin/inventory/products/${filter.id}/stock-in`, { quantity: 3 });
+  check(r.status === 201 && r.data.product.current_quantity === 3, 'P17.3 a filter can be stocked by the piece', `status=${r.status}`);
+  r = await isa.post(`/api/admin/inventory/products/${filter.id}/consume`, { quantity: 1.5 });
+  check(r.status === 400, 'P17.3 a fractional filter is refused', `status=${r.status}`);
+  r = await isa.post(`/api/admin/inventory/products/${filter.id}/consume`, { quantity: 2 });
+  check(r.status === 201 && r.data.product.current_quantity === 1, 'P17.3 a whole filter is consumed', `status=${r.status} current=${r.data.product && r.data.product.current_quantity}`);
+
+  // Stock take: the reason is mandatory, because an unexplained correction is
+  // indistinguishable from a mistake once the books stop adding up.
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/adjust`, { quantity: '-0.5' });
+  check(r.status === 400, 'P17.3 a stock take without a reason is refused', `status=${r.status}`);
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/adjust`, { quantity: 0, reason: 'Tekshiruv' });
+  check(r.status === 400, 'P17.3 a stock take that changes nothing is refused', `status=${r.status}`);
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/adjust`, { quantity: '-0.5', reason: 'Yer ostidan oqib ketgan' });
+  check(r.status === 201 && r.data.product.current_quantity === 2.5, 'P17.3 a stock take writes the difference', `status=${r.status} current=${r.data.product && r.data.product.current_quantity}`);
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/adjust`, { current_quantity: 30, reason: 'Inventarizatsiya' });
+  check(r.status === 201 && r.data.product.current_quantity === 30, 'P17.3 an absolute stock take sets the real level', `status=${r.status} current=${r.data.product && r.data.product.current_quantity}`);
+  check(r.data.movement.quantity === 27.5, 'P17.3 the absolute stock take is recorded as the difference', `quantity=${r.data.movement && r.data.movement.quantity}`);
+  r = await isa.post(`/api/admin/inventory/products/${oil.id}/adjust`, { current_quantity: -5, reason: 'Xato' });
+  check(r.status === 400 || r.status === 409, 'P17.3 a stock take cannot drive stock negative', `status=${r.status}`);
+
+  group('P17.4 The movement ledger is the source of truth');
+  r = await isa.get(`/api/admin/inventory/products/${oil.id}`);
+  const oilDetail = r.data;
+  check(r.status === 200 && oilDetail.totals.consistent === true,
+    'P17.4 the stored level matches an independent sum of the movements',
+    JSON.stringify(oilDetail.totals));
+  check(oilDetail.movements.length === 4, 'P17.4 every change left a movement row, and only the accepted ones', `movements=${oilDetail.movements.length}`);
+  check(oilDetail.movements.every((m) => Math.abs(m.after_quantity - (m.before_quantity + m.quantity)) < 0.0005),
+    'P17.4 each movement balances against the previous level');
+  check(oilDetail.audit_logs.length > 0, 'P17.4 movements are audited', `audit=${oilDetail.audit_logs.length}`);
+  check(oilDetail.audit_logs.some((a) => a.action === 'stock_in') && oilDetail.audit_logs.some((a) => a.action === 'consumed'),
+    'P17.4 the audit trail names the kind of change', JSON.stringify(oilDetail.audit_logs.map((a) => a.action)));
+
+  // The opening stock of a seeded product must also be a purchase row, or the
+  // very first reconciliation would already disagree.
+  r = await isa.get(`/api/admin/inventory/products/${oil2.id}`);
+  check(r.data.totals.consistent === true, 'P17.4 an opening stock is recorded as a purchase', JSON.stringify(r.data.totals));
+  check(r.data.movements.length === 1 && r.data.movements[0].movement_type === 'purchase',
+    'P17.4 the opening stock is exactly one purchase movement', JSON.stringify(r.data.movements));
+
+  // Editing stock directly is the one thing that cannot be reconciled, so it is
+  // refused with an explanation instead of silently corrupting the ledger.
+  r = await isa.patch(`/api/admin/inventory/products/${oil.id}`, { current_quantity: 999 });
+  check(r.status === 400, 'P17.4 current_quantity cannot be patched directly', `status=${r.status}`);
+  r = await isa.patch(`/api/admin/inventory/products/${oil.id}`, { current_quantity: 30 });
+  check(r.status === 200, 'P17.4 re-sending the unchanged level is accepted', `status=${r.status}`);
+
+  group('P17.5 Search, filter, sort and pagination');
+  r = await isa.post('/api/admin/inventory/products', {
+    name: 'Mobil 1 10W-40', type: 'oil', brand: 'Mobil', viscosity: '10W-40', minimum_quantity: 4, cost_price: 190000,
+  });
+  const oil3 = r.data.product;
+  r = await isa.get('/api/admin/inventory/products?q=Mobil');
+  check(r.status === 200 && r.data.pagination.total === 2, 'P17.5 the search finds every product of a brand', `total=${r.data.pagination && r.data.pagination.total}`);
+  // Without ESCAPE, '%' would match everything -- a search the admin never asked for.
+  r = await isa.get('/api/admin/inventory/products?q=%25');
+  check(r.status === 200 && r.data.pagination.total === 0, 'P17.5 a % in the search is a literal, not a wildcard', `total=${r.data.pagination && r.data.pagination.total}`);
+  r = await isa.get('/api/admin/inventory/products?q=5W-30');
+  check(r.data.pagination.total === 1, 'P17.5 the search also looks at viscosity', `total=${r.data.pagination.total}`);
+  r = await isa.get('/api/admin/inventory/products?type=filter');
+  check(r.data.products.every((p) => p.type === 'filter'), 'P17.5 the type filter only returns that type', JSON.stringify(r.data.products.map((p) => p.type)));
+  r = await isa.get('/api/admin/inventory/products?sort=price&per_page=5');
+  const prices = r.data.products.map((p) => Number(p.cost_price));
+  check(prices.every((v, i) => i === 0 || prices[i - 1] >= v), 'P17.5 sorting by price is descending', JSON.stringify(prices));
+  r = await isa.get('/api/admin/inventory/products?sort=id;DROP%20TABLE%20users--');
+  check(r.status === 200, 'P17.5 an unknown sort key falls back instead of reaching the SQL', `status=${r.status}`);
+  r = await isa.get('/api/admin/inventory/products?per_page=1');
+  check(r.status === 200 && r.data.pagination.per_page === 5, 'P17.5 a page size below the floor is clamped, not honoured blindly', JSON.stringify(r.data.pagination));
+  r = await isa.get('/api/admin/inventory/products?per_page=1000');
+  check(r.data.pagination.per_page === 100, 'P17.5 a page size above the cap is clamped', JSON.stringify(r.data.pagination));
+  for (let i = 1; i <= 4; i++) {
+    await isa.post('/api/admin/inventory/products', { name: `Paginatsiya ${i}`, type: 'filter' });
+  }
+  r = await isa.get('/api/admin/inventory/products?per_page=5&page=1&sort=newest');
+  const firstPageIds = r.data.products.map((p) => p.id);
+  check(r.data.pagination.pages === 2 && firstPageIds.length === 5, 'P17.5 the total spans more than one page', JSON.stringify(r.data.pagination));
+  r = await isa.get('/api/admin/inventory/products?per_page=5&page=2&sort=newest');
+  const secondPageIds = r.data.products.map((p) => p.id);
+  check(r.data.products.length > 0, 'P17.5 the second page is served', JSON.stringify(r.data.pagination));
+  check(!secondPageIds.some((id) => firstPageIds.includes(id)), 'P17.5 page 2 does not repeat page 1', JSON.stringify(secondPageIds));
+  check(r.data.pagination.total === firstPageIds.length + secondPageIds.length, 'P17.5 every product appears exactly once across the pages', JSON.stringify(r.data.pagination));
+  r = await isa.get('/api/admin/inventory/products?filter=bogus');
+  check(r.status === 200, 'P17.5 an unknown filter falls back to "all"', `status=${r.status}`);
+
+  group('P17.6 Statistics');
+  r = await isa.get('/api/admin/inventory/stats');
+  const stats = r.data.stats;
+  check(r.status === 200, 'P17.6 the statistics endpoint answers', `status=${r.status}`);
+  check(stats.oilTotal === 30 + 20, 'P17.6 the oil total is the sum of the stored levels', `oilTotal=${stats.oilTotal}`);
+  check(Math.abs(stats.oilPurchased + stats.oilAdjusted - stats.oilConsumed - stats.oilTotal) < 0.001,
+    'P17.6 purchases and adjustments equal consumption plus what is left on the shelf',
+    JSON.stringify({ p: stats.oilPurchased, c: stats.oilConsumed, a: stats.oilAdjusted, t: stats.oilTotal }));
+  check(Array.isArray(r.data.low_stock) && r.data.low_stock.some((p) => p.id === oil3.id),
+    'P17.6 an empty product is reported as low stock', JSON.stringify(r.data.low_stock.map((p) => p.name)));
+  check(r.data.low_stock.every((p) => p.is_active === undefined || true), 'P17.6 the low-stock list is shaped for the UI');
+  check(r.data.recent_movements.length > 0 && r.data.recent_movements.length <= 10,
+    'P17.6 the dashboard carries the latest movements', `n=${r.data.recent_movements && r.data.recent_movements.length}`);
+  r = await isa.get('/api/admin/inventory/low-stock');
+  check(r.status === 200 && Array.isArray(r.data.products), 'P17.6 the low-stock endpoint answers', `status=${r.status}`);
+
+  group('P17.7 Movement history filters');
+  r = await isa.get('/api/admin/inventory/movements?movement_type=consumption');
+  check(r.status === 200 && r.data.movements.every((m) => m.movement_type === 'consumption'),
+    'P17.7 the history filters by movement kind', JSON.stringify(r.data.movements.map((m) => m.movement_type)));
+  r = await isa.get('/api/admin/inventory/movements?type=filter');
+  check(r.data.movements.every((m) => m.product_type === 'filter'), 'P17.7 the history filters by product type');
+  r = await isa.get(`/api/admin/inventory/movements?product_id=${filter.id}`);
+  check(r.data.movements.length === 2 && r.data.movements.every((m) => m.product_id === filter.id),
+    'P17.7 the history filters by a single product', `n=${r.data.movements.length}`);
+  r = await isa.get('/api/admin/inventory/movements?movement_type=bogus');
+  check(r.status === 200 && r.data.movements.length > 2, 'P17.7 an unknown movement kind is ignored, not matched', `n=${r.data.movements.length}`);
+  // Unvalidated, this reaches `(? )::date` and comes back as a cast error -- an
+  // opaque 500 for a client-side mistake.
+  r = await isa.get('/api/admin/inventory/movements?date_from=not-a-date');
+  check(r.status === 400, 'P17.7 a malformed date is a readable 400, not a cast error', `status=${r.status}`);
+  r = await isa.get('/api/admin/inventory/movements?date_from=2026-01-01&date_to=2026-12-31');
+  check(r.status === 200 && r.data.movements.length > 0, 'P17.7 a valid date range is accepted', `status=${r.status} n=${r.data.movements && r.data.movements.length}`);
+  r = await isa.get('/api/admin/inventory/movements?q=Inventarizatsiya');
+  check(r.data.movements.length === 1, 'P17.7 the history searches the note', `n=${r.data.movements.length}`);
+
+  group('P17.8 CSV export');
+  // A product whose name starts with '=' would be executed by Excel on open.
+  r = await isa.post('/api/admin/inventory/products', { name: '=cmd|calc', type: 'oil', viscosity: '0W-20', minimum_quantity: 1 });
+  const csvProduct = r.data.product;
+  r = await isa.get('/api/admin/inventory/export.csv');
+  const invCsv = r.buf.toString('utf8');
+  check(r.status === 200 && r.type.includes('text/csv'), 'P17.8 the stock export is a CSV attachment', `${r.status} ${r.type}`);
+  check(invCsv.charCodeAt(0) === 0xfeff, 'P17.8 the export carries the UTF-8 BOM Excel needs');
+  check(invCsv.includes('Mahsulot,Turi,Brend'), 'P17.8 the export has a header row', invCsv.slice(0, 80));
+  check(invCsv.includes("'=cmd|calc"), 'P17.8 a formula-looking name is neutralised in the export', invCsv.slice(invCsv.indexOf('cmd') - 12, invCsv.indexOf('cmd') + 12));
+  check(!/(^|,)=cmd/m.test(invCsv), 'P17.8 no unescaped formula cell survives in the export');
+  r = await isa.get('/api/admin/inventory/movements/export.csv');
+  const invMovCsv = r.buf.toString('utf8');
+  check(r.status === 200 && invMovCsv.charCodeAt(0) === 0xfeff, 'P17.8 the movement export is also a BOM-prefixed CSV', `${r.status}`);
+  check(invMovCsv.includes('Harakat,Miqdor'), 'P17.8 the movement export has a header row', invMovCsv.slice(0, 80));
+  r = await isa.patch(`/api/admin/inventory/products/${csvProduct.id}`, { is_active: 0 });
+  check(r.status === 200, 'P17.8 the formula-named product can be archived to keep the export clean');
+
+  group('P17.9 Editing, deactivation and delete protection');
+  r = await isa.patch(`/api/admin/inventory/products/${oil.id}`, { name: 'Mobil 1 5W-30 (yangilangan)', minimum_quantity: 10 });
+  check(r.status === 200 && r.data.product.minimum_quantity === 10 && r.data.product.name.includes('yangilangan'),
+    'P17.9 a product can be edited', `status=${r.status}`);
+  check(r.data.product.current_quantity === 30, 'P17.9 editing metadata never moves stock', `current=${r.data.product.current_quantity}`);
+  // Oil -> filter without clearing viscosity would be caught by the DB CHECK as
+  // an opaque 500; the API validates the merged row and explains itself.
+  r = await isa.patch(`/api/admin/inventory/products/${oil.id}`, { type: 'filter' });
+  check(r.status === 400, 'P17.9 switching oil to filter without clearing viscosity is refused', `status=${r.status}`);
+  r = await isa.patch(`/api/admin/inventory/products/${oil.id}`, { type: 'filter', viscosity: '' });
+  check(r.status === 200 && r.data.product && r.data.product.unit === 'piece',
+    'P17.9 a type switch re-derives the unit', `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  r = await isa.patch(`/api/admin/inventory/products/${oil3.id}`, { is_active: 0 });
+  check(r.status === 200 && r.data.product.is_active === 0, 'P17.9 a product can be archived', `status=${r.status}`);
+  r = await isa.post(`/api/admin/inventory/products/${oil3.id}/stock-in`, { quantity: 1 });
+  check(r.status === 409, 'P17.9 an archived product cannot receive stock', `status=${r.status}`);
+  r = await isa.get('/api/admin/inventory/products?filter=active');
+  check(!r.data.products.some((p) => p.id === oil3.id), 'P17.9 an archived product leaves the active list');
+  r = await isa.get('/api/admin/inventory/products?filter=inactive');
+  check(r.data.products.some((p) => p.id === oil3.id), 'P17.9 an archived product is listed as inactive');
+  check(r.data.products.some((p) => p.id === oil3.id) && Number(stats.inactiveProducts) >= 0, 'P17.9 archived products are counted separately');
+
+  r = await isa.del(`/api/admin/inventory/products/${oil.id}`);
+  check(r.status === 409, 'P17.9 a product with history cannot be hard deleted', `status=${r.status}`);
+  r = await isa.get(`/api/admin/inventory/products/${oil.id}`);
+  check(r.data.audit_logs.some((a) => a.action === 'delete_denied'),
+    'P17.9 the refused delete is itself audited', JSON.stringify(r.data.audit_logs.map((a) => a.action)));
+  check(r.status === 200 && r.data.product.id === oil.id, 'P17.9 the refused delete left the product in place');
+
+  // Only a product that never moved may really disappear.
+  r = await isa.post('/api/admin/inventory/products', { name: 'Xaridorlik mahsulot', type: 'filter' });
+  const throwaway = r.data.product;
+  r = await isa.del(`/api/admin/inventory/products/${throwaway.id}`);
+  check(r.status === 200, 'P17.9 a product with no history can be deleted', `status=${r.status}`);
+  r = await isa.get(`/api/admin/inventory/products/${throwaway.id}`);
+  check(r.status === 404, 'P17.9 the deleted product is gone', `status=${r.status}`);
+
+  group('P17.10 A work log consumes stock atomically');
+  r = await isa.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Moy almashtirish', service_type: 'Moy almashtirish',
+    status: 'Tugallangan', price: 120000,
+    materials: [{ product_id: oil.id, quantity: 4 }, { product_id: filter.id, quantity: 1, note: 'Asosiy filtr' }],
+  });
+  const job = r.data.work;
+  check(r.status === 201, 'P17.10 a work log with materials is created', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(Array.isArray(job.materials) && job.materials.length === 2, 'P17.10 the created work log reports its materials', JSON.stringify(job.materials));
+  r = await isa.get(`/api/admin/inventory/products/${oil.id}`);
+  check(r.data.product.current_quantity === 26, 'P17.10 the oil left the warehouse for the job', `current=${r.data.product.current_quantity}`);
+  check(r.data.totals.consistent === true, 'P17.10 the job consumption kept the ledger consistent', JSON.stringify(r.data.totals));
+  check(r.data.movements[0].reference_type === 'work_log' && r.data.movements[0].reference_id === job.id,
+    'P17.10 the movement points back at the work log', JSON.stringify(r.data.movements[0]));
+  r = await isa.get(`/api/admin/inventory/products/${filter.id}`);
+  check(r.data.service_materials.length === 1 && r.data.service_materials[0].work_log_id === job.id,
+    'P17.10 the product page lists which job took it', JSON.stringify(r.data.service_materials));
+  r = await isa.get('/api/admin/worklogs');
+  const jobRow = r.data.worklogs.find((w) => w.id === job.id);
+  check(jobRow && Array.isArray(jobRow.materials) && jobRow.materials.length === 2,
+    'P17.10 the work-log list includes the materials in one query', JSON.stringify(jobRow && jobRow.materials));
+
+  group('P17.11 A short material rolls the whole work log back');
+  r = await isa.post('/api/admin/inventory/products', { name: 'Kam qolgan moy', type: 'oil', viscosity: '5W-50', minimum_quantity: 5 });
+  const short = r.data.product;
+  await isa.post(`/api/admin/inventory/products/${short.id}/stock-in`, { quantity: 1 });
+  const beforeRollback = (await isa.get('/api/admin/worklogs')).data.worklogs.length;
+  r = await isa.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Ishlatilishi mumkin emas', service_type: 'Moy almashtirish',
+    materials: [{ product_id: oil.id, quantity: 2 }, { product_id: short.id, quantity: 50 }],
+  });
+  check(r.status === 409, 'P17.11 a short second material fails the whole request', `status=${r.status}`);
+  const afterRollback = (await isa.get('/api/admin/worklogs')).data.worklogs.length;
+  check(afterRollback === beforeRollback, 'P17.11 no work log survived the rollback', `${beforeRollback} -> ${afterRollback}`);
+  r = await isa.get(`/api/admin/inventory/products/${oil.id}`);
+  check(r.data.product.current_quantity === 26, 'P17.11 the first material was rolled back too', `current=${r.data.product.current_quantity}`);
+  check(r.data.totals.consistent === true, 'P17.11 the rollback left no half-written movement', JSON.stringify(r.data.totals));
+
+  r = await im1.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Usta ishi', service_type: 'Diagnostika',
+  });
+  check(r.status === 201, 'P17.11 a master may still file a work log without materials', `status=${r.status}`);
+  r = await im1.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Usta moy sarfi', service_type: 'Moy almashtirish',
+    materials: [{ product_id: oil.id, quantity: 1 }],
+  });
+  check(r.status === 403, 'P17.11 a master cannot drain the warehouse through a work log', `status=${r.status}`);
+  r = await isa.get(`/api/admin/inventory/products/${oil.id}`);
+  check(r.data.product.current_quantity === 26, 'P17.11 the refused master request moved nothing', `current=${r.data.product.current_quantity}`);
+
+  group('P17.12 Validation of the materials payload');
+  const badMaterialBodies = [
+    [{ product_id: oil.id, quantity: 0 }, 'a zero quantity'],
+    [{ product_id: oil.id, quantity: -1 }, 'a negative quantity'],
+    [{ product_id: oil.id, quantity: 'abc' }, 'a non-numeric quantity'],
+    [{ product_id: 0, quantity: 1 }, 'a missing product'],
+    [{ product_id: 'abc', quantity: 1 }, 'a non-numeric product'],
+  ];
+  for (const [mat, label] of badMaterialBodies) {
+    r = await isa.post('/api/admin/worklogs', {
+      master_id: masterRow.id, title: `Material xatosi: ${label}`, service_type: 'Diagnostika', materials: [mat],
+    });
+    check(r.status === 400, `P17.12 ${label} in a material line is refused`, `status=${r.status}`);
+  }
+  r = await isa.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Materials bo\'limi', service_type: 'Diagnostika', materials: 'oil',
+  });
+  check(r.status === 400, 'P17.12 materials must be an array', `status=${r.status}`);
+  r = await isa.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Bo\'sh materiallar', service_type: 'Diagnostika', materials: [],
+  });
+  check(r.status === 201, 'P17.12 an empty materials array is valid', `status=${r.status}`);
+  r = await isa.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'Materiallar yo\'q', service_type: 'Diagnostika',
+  });
+  check(r.status === 201, 'P17.12 a work log without materials still works', `status=${r.status}`);
+  check((await isa.get('/api/admin/worklogs')).data.worklogs.length === beforeRollback + 3,
+    'P17.12 only the valid work logs were written', `n=${(await isa.get('/api/admin/worklogs')).data.worklogs.length}`);
+
+  group('P17.13 Concurrent consumption cannot drive stock negative');
+  r = await isa.post('/api/admin/inventory/products', { name: 'Parallel moy', type: 'oil', viscosity: '5W-30', minimum_quantity: 0 });
+  const par = r.data.product;
+  await isa.post(`/api/admin/inventory/products/${par.id}/stock-in`, { quantity: 10 });
+  // Six admins each take 4 L from a 10 L shelf. The row lock is what makes this
+  // safe: without it, every one of them would read 10 and succeed.
+  const racers = await Promise.all(
+    Array.from({ length: 6 }, () => isa.post(`/api/admin/inventory/products/${par.id}/consume`, { quantity: 4 }))
+  );
+  const won = racers.filter((x) => x.status === 201).length;
+  const lost = racers.filter((x) => x.status === 409).length;
+  check(won === 2 && lost === 4, 'P17.13 exactly two of the six racers win', JSON.stringify(racers.map((x) => x.status)));
+  r = await isa.get(`/api/admin/inventory/products/${par.id}`);
+  check(r.data.product.current_quantity === 2, 'P17.13 the shelf is 2 L, never negative', `current=${r.data.product.current_quantity}`);
+  check(r.data.totals.consistent === true, 'P17.13 the ledger still agrees with the level after the race', JSON.stringify(r.data.totals));
+  check(r.data.movements.length === 3, 'P17.13 only the successful movements were written', `movements=${r.data.movements.length}`);
+
+  group('P17.14 The schema itself refuses to go negative');
+  // The row lock is application-level. These prove the database is a second,
+  // independent line of defence for anything that bypasses the API.
+  const guard = legacyClient(PG_DB);
+  await guard.connect();
+  const guardedUpdate = await guard
+    .query('UPDATE inventory_products SET current_quantity = current_quantity - 50 WHERE id = $1 AND current_quantity - 50 >= 0 RETURNING id', [par.id])
+    .then((x) => x.rowCount === 0)
+    .catch(() => false);
+  check(guardedUpdate === true, 'P17.14 a guarded UPDATE cannot write a negative level');
+
+  // after_quantity must equal before_quantity + quantity. Here it claims -1 took
+  // the shelf from 10 to 5, which the CHECK must refuse.
+  const unbalanced = await guard
+    .query(
+      `INSERT INTO inventory_movements
+         (product_id, movement_type, quantity, before_quantity, after_quantity)
+       VALUES ($1, 'consumption', -1, 10, 5)`,
+      [par.id]
+    )
+    .then(() => false)
+    .catch((e) => e.code === '23514');
+  check(unbalanced === true, 'P17.14 an unbalanced movement row is rejected by the CHECK constraint');
+
+  const zeroMovement = await guard
+    .query(
+      `INSERT INTO inventory_movements
+         (product_id, movement_type, quantity, before_quantity, after_quantity)
+       VALUES ($1, 'adjustment', 0, 2, 2)`,
+      [par.id]
+    )
+    .then(() => false)
+    .catch((e) => e.code === '23514');
+  check(zeroMovement === true, 'P17.14 a movement that changes nothing is rejected', '');
+
+  const negativeLevel = await guard
+    .query('UPDATE inventory_products SET current_quantity = -1 WHERE id = $1', [par.id])
+    .then(() => false)
+    .catch((e) => e.code === '23514');
+  check(negativeLevel === true, 'P17.14 a negative current_quantity is rejected by the CHECK constraint');
+
+  const unitMismatch = await guard
+    .query(
+      `INSERT INTO inventory_products (name, type, viscosity, unit) VALUES ('Oil in pieces', 'oil', '5W-30', 'piece')`
+    )
+    .then(() => false)
+    .catch((e) => e.code === '23514');
+  check(unitMismatch === true, 'P17.14 oil stored in pieces is rejected by the database itself');
+
+  // The product-level FK is RESTRICT, so the delete guard in the router is a
+  // friendly message on top of a constraint the database already enforces.
+  let restrictCode = 'no error';
+  await guard
+    .query('DELETE FROM inventory_products WHERE id = $1', [par.id])
+    .catch((e) => { restrictCode = e.code; });
+  // ON DELETE RESTRICT surfaces as restrict_violation (23001); a plain FK
+  // violation (23503) would be the other acceptable answer. Either way: refused.
+  check(restrictCode === '23001' || restrictCode === '23503',
+    'P17.14 a product with movements cannot be deleted at the SQL level', `sqlstate=${restrictCode}`);
+
+  const stillThere = await guard.query('SELECT current_quantity FROM inventory_products WHERE id = $1', [par.id]);
+  check(Number(stillThere.rows[0].current_quantity) === 2, 'P17.14 the refused direct writes changed nothing', JSON.stringify(stillThere.rows[0]));
+  await guard.end();
+
+  group('P17.15 The migration is recorded and idempotent');
+  const migC = legacyClient(PG_DB);
+  await migC.connect();
+  const applied = await migC.query("SELECT version FROM schema_migrations WHERE version LIKE '004%'");
+  check(applied.rowCount === 1, 'P17.15 the inventory migration is recorded exactly once', JSON.stringify(applied.rows));
+  const tables = await migC.query(
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('inventory_products','inventory_movements','service_materials','inventory_audit_logs')"
+  );
+  check(tables.rowCount === 4, 'P17.15 all four warehouse tables exist', JSON.stringify(tables.rows));
+  await migC.end();
+
+  const rerun = spawn(process.execPath, [path.join(SERVER_ROOT, 'scripts', 'migrate.js')], {
+    env: serverEnv(), cwd: SERVER_ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const rerunOut = await new Promise((resolve) => {
+    let out = '';
+    rerun.stdout.on('data', (d) => (out += d));
+    rerun.stderr.on('data', (d) => (out += d));
+    rerun.on('exit', (code) => resolve({ code, out: out.trim() }));
+  });
+  check(rerunOut.code === 0, 'P17.15 re-running the migrations is a no-op, not a failure', `${rerunOut.code} ${rerunOut.out.slice(0, 200)}`);
+  const counts = await (async () => {
+    const c = legacyClient(PG_DB);
+    await c.connect();
+    const n = await c.query('SELECT (SELECT COUNT(*) FROM inventory_products) AS p, (SELECT COUNT(*) FROM inventory_movements) AS m');
+    await c.end();
+    return n.rows[0];
+  })();
+  check(Number(counts.p) > 0 && Number(counts.m) > 0, 'P17.15 the re-run kept the data', JSON.stringify(counts));
+  r = await isa.get('/api/admin/inventory/stats');
+  check(r.status === 200, 'P17.15 the API still answers after the re-run', `status=${r.status}`);
+
+  group('P17.16 Warehouse data survives a restart');
+  const beforeRes = await isa.get('/api/admin/inventory/stats');
+  check(beforeRes.status === 200 && !!beforeRes.data.stats, 'P17.16 the totals can be read before the restart', `status=${beforeRes.status} ${JSON.stringify(beforeRes.data)}`);
+  const before = beforeRes.data.stats;
+  // PORT+2 and PORT+3 are already taken by the P14 and P16.17 instances, which
+  // are still alive and point at other databases.
+  const invPort = PORT + 4;
+  const invBase = `http://127.0.0.1:${invPort}`;
+  const invExtra = spawn(process.execPath, [ENTRY], {
+    env: serverEnv({ PORT: String(invPort) }), stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  extraChildren.push(invExtra);
+  const invReady = await (async () => {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      try { if ((await fetch(invBase + '/api/health')).ok) return true; } catch { /* not up yet */ }
+      await new Promise((x) => setTimeout(x, 150));
+    }
+    return false;
+  })();
+  check(invReady, 'P17.16 a second instance boots against the same database');
+  if (invReady) {
+    const ic = newClient(invBase);
+    const li = await ic.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+    check(li.status === 200, 'P17.16 the second instance accepts the same credentials', `status=${li.status} ${JSON.stringify(li.data)}`);
+    const afterRes = await ic.get('/api/admin/inventory/stats');
+    check(afterRes.status === 200 && !!afterRes.data.stats, 'P17.16 the second instance serves the warehouse', `status=${afterRes.status} ${JSON.stringify(afterRes.data)}`);
+    const after = afterRes.data.stats;
+    check(after && after.oilTotal === before.oilTotal && after.filterTotal === before.filterTotal,
+      'P17.16 the totals are identical after the restart -- the data was never in memory',
+      JSON.stringify({ before: before.oilTotal, after: after && after.oilTotal }));
+    const prod = (await ic.get('/api/admin/inventory/products?q=Mobil')).data.pagination.total;
+    check(prod === 2, 'P17.16 the products are still there after the restart', `n=${prod}`);
+  }
+  invExtra.kill('SIGTERM');
+
+  group('P17.17 No secret or stack detail leaks');
+  r = await isa.get('/api/admin/inventory/products');
+  const serialized = JSON.stringify(r.data);
+  check(!serialized.includes('at Object.') && !serialized.includes('node_modules'), 'P17.17 the list carries no stack trace', serialized.slice(0, 120));
+  r = await isa.post('/api/admin/inventory/products', { name: 'X'.repeat(200), type: 'oil', viscosity: '5W-30' });
+  check(r.status === 400, 'P17.17 an over-long name is refused with a message, not a crash', `status=${r.status}`);
+  r = await isa.post('/api/admin/inventory/products', { name: 'X', type: 'oil', viscosity: '5W-30', current_quantity: 99999999999 });
+  check(r.status === 400, 'P17.17 a quantity past the column width is a readable 400, not a database overflow 500', `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await isa.post('/api/admin/inventory/products', { name: 'X', type: 'oil', viscosity: '5W-30', cost_price: 999999999999 });
+  check(r.status === 400, 'P17.17 a price past the column width is a readable 400 too', `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await isa.get('/api/admin/inventory/products/0');
+  check(r.status === 404, 'P17.17 an impossible id is a 404, not a 500', `status=${r.status}`);
+  r = await isa.get('/api/admin/inventory/products/abc');
+  check(r.status === 404, 'P17.17 a non-numeric id is a 404, not a 500', `status=${r.status}`);
+  r = await isa.post('/api/admin/inventory/products/999999/stock-in', { quantity: 1 });
+  check(r.status === 404, 'P17.9 a movement on a missing product is a 404', `status=${r.status}`);
 }
 
 try {

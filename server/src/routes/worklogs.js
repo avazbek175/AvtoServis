@@ -5,6 +5,7 @@ const multer = require('multer');
 const { db } = require('../db');
 const auth = require('../auth');
 const storage = require('../storage');
+const inv = require('../inventory');
 
 const router = require('../asyncRoute').wrapRouter(express.Router());
 router.use(auth.authenticate);
@@ -50,6 +51,96 @@ async function imagesFor(workId) {
   return db
     .prepare('SELECT id, image_path, original_filename FROM work_log_images WHERE work_log_id = ? ORDER BY id ASC')
     .all(workId);
+}
+
+/**
+ * Oil and filters consumed by a work, for every id in the batch.
+ *
+ * One query for the whole page rather than one per work log: the list endpoint
+ * is unpaginated, so an N+1 here would mean a query per row on every refresh.
+ */
+async function materialsFor(workIds) {
+  const ids = Array.from(new Set(workIds.filter((n) => Number.isInteger(n))));
+  if (!ids.length) return new Map();
+  const rows = await db
+    .prepare(
+      `SELECT sm.work_log_id, sm.id, sm.product_id, sm.quantity, sm.movement_id,
+              p.name AS product_name, p.type AS product_type, p.brand, p.viscosity, p.unit
+         FROM service_materials sm JOIN inventory_products p ON p.id = sm.product_id
+        WHERE sm.work_log_id = ANY(?::int[]) ORDER BY sm.id ASC`
+    )
+    .all([ids]);
+  const map = new Map();
+  for (const row of rows) {
+    if (!map.has(row.work_log_id)) map.set(row.work_log_id, []);
+    map.get(row.work_log_id).push(row);
+  }
+  return map;
+}
+
+/**
+ * Validates the `materials` array of a work-log request.
+ *
+ * Shape is `[{ product_id, quantity }]`. An empty or absent array is valid and
+ * means "this job consumed nothing from the warehouse", so every existing caller
+ * that sends no materials keeps working unchanged.
+ *
+ * Only the shape is checked here. Whether the stock is *sufficient* is decided
+ * later, inside the transaction, once the row lock is held -- checking earlier
+ * would be a time-of-check-to-time-of-use race against any other admin.
+ */
+function validateMaterials(raw) {
+  if (raw === undefined || raw === null || raw === '') return [];
+  if (!Array.isArray(raw)) throw inv.badRequest(' materiallar ro\'yxati bo\'lishi kerak');
+  if (raw.length > 30) throw inv.badRequest('Bir ishga 30 tadan ko\'p material kiritib bo\'lmaydi');
+  return raw.map((m, i) => {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      throw inv.badRequest(`${i + 1}-material noto'g'ri formatda`);
+    }
+    const productId = Number(m.product_id);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      throw inv.badRequest(`${i + 1}-material uchun mahsulot tanlanmagan`);
+    }
+    const quantity = inv.parseQty(m.quantity, `${i + 1}-material miqdori`, { allowZero: true });
+    if (quantity <= 0) throw inv.badRequest(`${i + 1}-material miqdori 0 dan katta bo'lishi kerak`);
+    return {
+      product_id: productId,
+      quantity,
+      note: inv.text(m.note, `${i + 1}-material izohi`, { max: 200 }),
+    };
+  });
+}
+
+/**
+ * Consumes every listed material inside the caller's transaction.
+ *
+ * The work log row and every stock movement land in the same transaction, so the
+ * warehouse can never record oil leaving for a job that does not exist, and a
+ * job can never exist with oil that never left. If the third product is short,
+ * the first two are rolled back with everything else.
+ *
+ * MUST be called inside db.transaction().
+ */
+async function consumeMaterials(t, req, workLogId, materials) {
+  for (const m of materials) {
+    // applyMovement locks the product row FOR UPDATE, checks sufficiency and
+    // writes the movement -- all on this transaction's connection.
+    const { movement } = await inv.applyMovement(t, {
+      productId: m.product_id,
+      movementType: 'consumption',
+      quantity: m.quantity,
+      req,
+      note: m.note || 'Ishda ishlatildi',
+      referenceType: 'work_log',
+      referenceId: workLogId,
+    });
+    await t
+      .prepare(
+        'INSERT INTO service_materials (work_log_id, product_id, quantity, movement_id) VALUES (?, ?, ?, ?)'
+      )
+      .run(workLogId, m.product_id, m.quantity, movement.id);
+  }
+  return materials.length;
 }
 
 async function decorate(row) {
@@ -155,8 +246,15 @@ router.get('/', async (req, res) => {
   const rows = await db
     .prepare(`SELECT ${WORK_LIST_FIELDS} FROM work_logs w LEFT JOIN users u ON u.id = w.master_id ${where} ORDER BY w.created_at DESC, w.id DESC`)
     .all(params);
+  // One batched query for the whole page, so the list does not pay a per-row
+  // round trip just to show which oil went into which job.
+  const mats = await materialsFor(rows.map((r) => r.id));
   const out = [];
-  for (const row of rows) out.push(await decorate(row));
+  for (const row of rows) {
+    const w = await decorate(row);
+    w.materials = mats.get(row.id) || [];
+    out.push(w);
+  }
   res.json({ worklogs: out });
 });
 
@@ -197,26 +295,49 @@ router.post('/', async (req, res) => {
   }
   const v = validateWorkBody(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
+  // Shape-only validation. Sufficiency is checked under the row lock below, in
+  // the same transaction as the insert.
+  const materials = validateMaterials(req.body && req.body.materials);
+  // Stock is an admin asset: a master may file a work log but must not move it.
+  if (materials.length && !isSA(req.user)) {
+    return res.status(403).json({ error: 'Ombordan mahsulot sarflash faqat admin uchun' });
+  }
   const isPublic = isSA(req.user) ? (req.body.is_public ? 1 : 0) : 0;
-  // RETURNING id replaces SQLite's last_insert_rowid().
-  const created = await db
-    .prepare(`INSERT INTO work_logs
-      (master_id, title, customer_name, customer_phone, car_brand, car_model, car_number,
-       service_type, description, start_date, end_date, price, status, notes, is_public)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      RETURNING id`)
-    .one(
-      masterId, v.title, v.customer_name, v.customer_phone, v.car_brand, v.car_model, v.car_number,
-      v.service_type, v.description, v.start_date, v.end_date, v.price, v.status, v.notes, isPublic
-    );
-  res.status(201).json({ work: await decorate(await loadWork(created.id)) });
+
+  // The work log and its stock movements share one transaction. Without it, a
+  // short second material would leave a work log recorded with no oil taken, or
+  // -- worse -- oil taken for a work log that never got written.
+  const inserted = await db.transaction(async (t) => {
+    // RETURNING id replaces SQLite's last_insert_rowid().
+    const work = await t
+      .prepare(`INSERT INTO work_logs
+        (master_id, title, customer_name, customer_phone, car_brand, car_model, car_number,
+         service_type, description, start_date, end_date, price, status, notes, is_public)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id`)
+      .one(
+        masterId, v.title, v.customer_name, v.customer_phone, v.car_brand, v.car_model, v.car_number,
+        v.service_type, v.description, v.start_date, v.end_date, v.price, v.status, v.notes, isPublic
+      );
+    await consumeMaterials(t, req, work.id, materials);
+    return work;
+  });
+
+  const created = await loadWork(inserted.id);
+  const decorated = await decorate(created);
+  // Same shape as GET /:id, so a client that submits materials does not have to
+  // issue a second request to learn what was actually taken.
+  decorated.materials = (await materialsFor([created.id])).get(created.id) || [];
+  res.status(201).json({ work: decorated });
 });
 
 router.get('/:id', async (req, res) => {
   const work = await loadWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Ish topilmadi' });
   if (!canAccess(req, work)) return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
-  res.json({ work: await decorate(work) });
+  const decorated = await decorate(work);
+  decorated.materials = (await materialsFor([work.id])).get(work.id) || [];
+  res.json({ work: decorated });
 });
 
 router.put('/:id', async (req, res) => {
