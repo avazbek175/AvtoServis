@@ -533,7 +533,40 @@ router.get('/dashboard', async (req, res) => {
     const s = await getSetting(k);
     if (s.show !== undefined) visible[k] = s.show !== false;
   }
-  const stats = { totalServices, activeServices, masters, mastersActive, mediaCount };
+  // Debt ledger figures are aggregated by PostgreSQL over the live rows
+  // (deleted_at IS NULL). If the ledger tables are absent this must not break the
+  // whole dashboard, so the query is allowed to fail into zeroes.
+  let debtStats = { total: 0, outstanding: 0, debtors: 0, createdToday: 0 };
+  try {
+    const d = await db
+      .prepare(
+        `SELECT
+           COUNT(*)                                        AS total,
+           COALESCE(SUM(GREATEST(remaining_amount, 0)), 0) AS outstanding,
+           COUNT(*) FILTER (WHERE created_at >= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD')::text) AS createdToday
+         FROM debts WHERE deleted_at IS NULL`
+      )
+      .get();
+    debtStats = {
+      total: Number(d.total),
+      outstanding: Number(d.outstanding),
+      debtors: Number(d.total),
+      createdToday: Number(d.createdToday),
+    };
+  } catch {
+    /* ledger not migrated yet */
+  }
+  const stats = {
+    totalServices,
+    activeServices,
+    masters,
+    mastersActive,
+    mediaCount,
+    debtTotal: debtStats.total,
+    debtOutstanding: debtStats.outstanding,
+    debtTotalDebtors: debtStats.debtors,
+    debtCreatedToday: debtStats.createdToday,
+  };
   if (req.user.role === 'super_admin') {
     stats.pendingApplications = (await db.prepare("SELECT COUNT(*) c FROM master_applications WHERE status = 'pending'").get()).c;
   }

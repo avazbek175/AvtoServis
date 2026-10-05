@@ -7,3 +7,5 @@ server/data/
 server/uploads/
 .DS_Store
 .env
+.vercel
+.env*

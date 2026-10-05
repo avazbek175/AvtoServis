@@ -14,6 +14,7 @@ const adminRouter = require('./routes/admin');
 const mediaRouter = require('./routes/media');
 const worklogsRouter = require('./routes/worklogs');
 const workimagesRouter = require('./routes/workimages');
+const debtsRouter = require('./routes/debts').router;
 const { createCorsOptions, ConfigurationError } = require('./cors');
 
 const app = express();
@@ -242,6 +243,9 @@ app.use('/api/public', publicRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/media', mediaRouter);
 app.use('/api/admin/worklogs', worklogsRouter);
+// Debt ledger. Mounted after auth.authenticate inside the router, so every
+// endpoint requires an admin session; there is no public path to this data.
+app.use('/api/admin/debts', debtsRouter);
 app.use('/api/workimages', workimagesRouter);
 
 const uploadsDir = require('./paths').uploadsDir;
@@ -293,9 +297,13 @@ app.use((err, req, res, next) => {
   }
   // Validation errors carry `status`/`statusCode` in the 4xx range and are safe to
   // surface. Anything else is treated as a server fault so no internals leak.
+  // `err.expose` is the escape hatch for a deliberate 5xx whose message is meant
+  // for the operator (e.g. "DEBT_DELETE_PASS_KEY is not configured"), which would
+  // otherwise be flattened into an unhelpful generic 500.
   const raw = Number(err.status || err.statusCode);
-  const status = Number.isInteger(raw) && raw >= 400 && raw < 500 ? raw : 500;
-  res.status(status).json({ error: status >= 500 ? 'Internal server error' : err.message });
+  const deliberate = err.expose === true;
+  const status = Number.isInteger(raw) && raw >= 400 && (raw < 500 || deliberate) ? raw : 500;
+  res.status(status).json({ error: status >= 500 && !deliberate ? 'Internal server error' : err.message });
 });
 
 // Single-process deployment (e.g. `npm start` with the client built): serve the

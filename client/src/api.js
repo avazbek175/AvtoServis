@@ -35,4 +35,7 @@ export const api = {
   put: (p, body) => request(p, { method: 'PUT', body }),
   patch: (p, body) => request(p, { method: 'PATCH', body }),
   del: (p) => request(p, { method: 'DELETE' }),
+  // DELETE that carries a per-request header, used for the debt-ledger delete
+  // pass key. Kept separate from `del` so the common case stays header-free.
+  delWithHeaders: (p, headers) => request(p, { method: 'DELETE', headers }),
 };

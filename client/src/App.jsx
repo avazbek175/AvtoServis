@@ -10,6 +10,7 @@ import SectionPage from './pages/admin/SectionPage';
 import UsersAdmin from './pages/admin/UsersAdmin';
 import ApplicationsAdmin from './pages/admin/ApplicationsAdmin';
 import WorkLogs from './pages/admin/WorkLogs';
+import DebtLedger from './pages/admin/DebtLedger';
 import MediaAdmin from './pages/admin/MediaAdmin';
 import ProtectedRoute from './pages/admin/ProtectedRoute';
 
@@ -38,6 +39,7 @@ export default function App() {
         <Route path="users" element={<UsersAdmin />} />
         <Route path="applications" element={<ApplicationsAdmin />} />
         <Route path="worklogs" element={<WorkLogs />} />
+        <Route path="debts" element={<DebtLedger />} />
         <Route path="media" element={<MediaAdmin />} />
       </Route>
       <Route path="*" element={<Home />} />

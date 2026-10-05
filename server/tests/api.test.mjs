@@ -50,6 +50,12 @@ const EVIL_ORIGIN = 'https://evil.example';
 // The server must be able to bootstrap its first super admin in both dev and
 // prod runs, so the harness always configures the secret and sends it.
 const SETUP_SECRET = 'test-setup-secret-value';
+// P16: the delete pass key is a server-only secret. It is pinned here so the
+// tests can prove the correct value works, and P16.15 proves it is never
+// echoed back. It only ever lives in the spawned server's env, never in a
+// request body assertion or a client bundle.
+const DEBT_PASS_KEY = 'test-debt-pass-key-9f2c';
+const WRONG_DEBT_KEY = 'not-the-pass-key';
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -76,7 +82,7 @@ function check(ok, name, detail = '') {
   }
 }
 
-function newClient() {
+function newClient(origin = BASE) {
   const jar = new Map();
   return {
     async req(method, urlPath, body, isForm, extraHeaders) {
@@ -85,7 +91,7 @@ function newClient() {
       const cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
       if (cookie) headers['Cookie'] = cookie;
 
-      const res = await fetch(BASE + urlPath, {
+      const res = await fetch(origin + urlPath, {
         method,
         headers,
         redirect: 'manual',
@@ -107,6 +113,14 @@ function newClient() {
     put(p, b) { return this.req('PUT', p, b); },
     patch(p, b) { return this.req('PATCH', p, b); },
     del(p) { return this.req('DELETE', p); },
+    // DELETE carrying the debt-ledger pass key as a header. Body is left
+    // undefined on purpose so a test that forgets the header cannot pass by
+    // accident via a JSON body.
+    delWithKey(p, key) {
+      return key === undefined
+        ? this.req('DELETE', p)
+        : this.req('DELETE', p, undefined, false, { 'X-Debt-Pass-Key': key });
+    },
     from(origin, method, p, body) {
       return this.req(method || 'GET', p, body, false, { Origin: origin });
     },
@@ -198,6 +212,9 @@ function serverEnv(extra = {}) {
     LOGIN_RATE_LIMIT_MAX: '5',
     LOGIN_RATE_LIMIT_IP_MAX: '25',
     LOGIN_RATE_WINDOW_MS: '60000',
+    DEBT_DELETE_PASS_KEY: DEBT_PASS_KEY,
+    DEBT_DELETE_RATE_LIMIT_MAX: '5',
+    DEBT_DELETE_RATE_WINDOW_MS: '900000',
     ...extra,
   };
 }
@@ -602,6 +619,59 @@ async function securityTests(ctx) {
     r = await anonymous.from('http://127.0.0.1:5173', 'GET', '/api/public/services');
     check(r.status === 200 && acao(r) === 'http://127.0.0.1:5173', 'P1.15 dev mode allows 127.0.0.1', `status=${r.status}`);
   }
+
+  // A single deployment often serves more than one public host (e.g. a custom
+  // domain plus the *.vercel.app URL). CLIENT_ORIGIN has always accepted a
+  // comma/space separated list; this pins that behaviour, because silently
+  // ignoring all but the first entry would lock the operator out of their own
+  // site while still looking like a valid configuration.
+  const secondOrigin = 'https://custom-domain.example';
+  const multiEnv = serverEnv({
+    PORT: String(PORT + 6),
+    NODE_ENV: 'production',
+    CLIENT_ORIGIN: `${CLIENT_ORIGIN},${secondOrigin}`,
+    DB_TRACE_QUERIES: '',
+  });
+  const multi = spawn(process.execPath, [ENTRY], { env: multiEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  const multiOut = [];
+  multi.stdout.on('data', (d) => { multiOut.push(d.toString()); });
+  multi.stderr.on('data', (d) => { multiOut.push(d.toString()); });
+  const multiBase = BASE.replace(String(PORT), String(PORT + 6));
+  {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(multiBase + '/api/health');
+        if (res.ok) break;
+      } catch {}
+      await new Promise((r2) => setTimeout(r2, 150));
+    }
+  }
+  const multiFrom = async (origin) => {
+    const res = await fetch(multiBase + '/api/public/services', { headers: { Origin: origin } });
+    return { status: res.status, acao: res.headers.get('access-control-allow-origin') };
+  };
+  let mr = await multiFrom(CLIENT_ORIGIN);
+  check(mr.status === 200 && mr.acao === CLIENT_ORIGIN, 'P1.20 first origin in a list is allowed', `status=${mr.status} acao=${mr.acao}`);
+  mr = await multiFrom(secondOrigin);
+  check(mr.status === 200 && mr.acao === secondOrigin, 'P1.21 second origin in a list is allowed (custom domain works)', `status=${mr.status} acao=${mr.acao}`);
+  mr = await multiFrom(EVIL_ORIGIN);
+  check(mr.status === 403 && mr.acao === null, 'P1.22 a list does not become a wildcard', `status=${mr.status} acao=${mr.acao}`);
+  mr = await multiFrom(`${secondOrigin}.evil.com`);
+  check(mr.status === 403, 'P1.23 suffix lookalike of a listed origin rejected', `status=${mr.status}`);
+  mr = await multiFrom('https://javohirautoservis.uz.evil.com');
+  check(mr.status === 403, 'P1.24 origin-as-prefix lookalike rejected', `status=${mr.status}`);
+  const multiPre = await fetch(multiBase + '/api/auth/login', {
+    method: 'OPTIONS',
+    headers: { Origin: secondOrigin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type' },
+  });
+  check(
+    multiPre.headers.get('access-control-allow-origin') === secondOrigin &&
+      multiPre.headers.get('access-control-allow-credentials') === 'true',
+    'P1.25 preflight from the second listed origin echoes it with credentials',
+    `acao=${multiPre.headers.get('access-control-allow-origin')} acac=${multiPre.headers.get('access-control-allow-credentials')}`
+  );
+  multi.kill('SIGKILL');
 
   // production without CLIENT_ORIGIN must refuse to boot
   const env = serverEnv({ PORT: String(PORT + 7), NODE_ENV: 'production', DB_TRACE_QUERIES: '' });
@@ -1313,8 +1383,14 @@ async function legacySettingsTests() {
     'P12.8 the original table is preserved as settings_legacy', JSON.stringify(legacyTable.rows));
 
   const versions = await db.query('SELECT version FROM schema_migrations ORDER BY version');
-  check(versions.rows.map((r) => r.version).join(',') === '001_init.sql,002_settings_key_value.sql',
-    'P12.9 both migrations recorded in schema_migrations', versions.rows.map((r) => r.version).join(','));
+  const recorded = versions.rows.map((r) => r.version);
+  // Not a fixed list: later migrations exist, so assert the legacy two come first
+  // in order and that every migration file on disk was recorded exactly once.
+  const onDisk = fs.readdirSync(path.join(SERVER_ROOT, 'migrations')).filter((f) => f.endsWith('.sql')).sort();
+  check(recorded.slice(0, 2).join(',') === '001_init.sql,002_settings_key_value.sql'
+    && recorded.join(',') === onDisk.join(','),
+    'P12.9 every migration is recorded in schema_migrations, legacy two first',
+    `${recorded.join(',')} vs ${onDisk.join(',')}`);
 
   for (let i = 0; i < 2; i++) {
     const again = await migrateLegacyDb();
@@ -1557,6 +1633,328 @@ async function readinessTests() {
     `status=${svc.status} services=${svc.data?.services?.length}`);
   const wl = await get('/api/public/worklogs', legacyBase);
   check(wl.status === 200, 'P14.5 /api/public/worklogs answers 200 on the converted database', `status=${wl.status}`);
+
+  // =========================================================================
+  // P16. Debt ledger (Qarz daftari)
+  // =========================================================================
+  // Fresh clients so this group does not inherit session state from earlier
+  // groups. superadmin1's password is still password123 (both change-password
+  // attempts above were rejected, so it was never changed).
+  const dsa = newClient();
+  const dm1 = newClient();
+  let r = await dsa.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+  check(r.status === 200, 'P16.0 the super admin can sign in for the ledger tests');
+  await dm1.post('/api/auth/login', { username: 'usta1', password: 'password123' });
+
+  const anonD = newClient();
+
+  group('P16.1 Debt data is admin-only');
+  for (const [m, p] of [['GET', '/api/admin/debts'], ['GET', '/api/admin/debts/stats'], ['GET', '/api/admin/debts/export.csv'], ['POST', '/api/admin/debts'], ['DELETE', '/api/admin/debts/1']]) {
+    r = await anonD.req(m, p);
+    check(r.status === 401, `P16.1 unauthenticated ${m} ${p} is refused`, `status=${r.status}`);
+  }
+  r = await anonD.req('GET', '/api/public/debts');
+  check(r.status === 404, 'P16.1 there is no public /api/public/debts endpoint', `status=${r.status}`);
+  r = await anonD.req('GET', '/api/debts');
+  check(r.status === 404, 'P16.1 there is no public /api/debts endpoint', `status=${r.status}`);
+  r = await dm1.get('/api/admin/debts');
+  check(r.status === 200, 'P16.1 a logged-in master may read the ledger');
+
+  group('P16.2 Create validation');
+  r = await dsa.post('/api/admin/debts', { phone: '+998901112233', address: 'Urganch', service: 'Moy', debt_amount: 1000 });
+  check(r.status === 400, 'P16.2 a missing name is refused', `status=${r.status}`);
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', address: 'Urganch', service: 'Moy', debt_amount: 1000 });
+  check(r.status === 400, 'P16.2 a missing phone is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', service: 'Moy', debt_amount: 1000 });
+  check(r.status === 400, 'P16.2 a missing address is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', debt_amount: 1000 });
+  check(r.status === 400, 'P16.2 a missing service is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy' });
+  check(r.status === 400, 'P16.2 a missing amount is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy', debt_amount: -1000 });
+  check(r.status === 400, 'P16.2 a negative amount is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy', debt_amount: 1500.75 });
+  check(r.status === 400, 'P16.2 a fractional amount is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy', debt_amount: '12abc' });
+  check(r.status === 400, 'P16.2 a partially numeric amount is refused (no parseFloat truncation)');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy', debt_amount: 0 });
+  check(r.status === 400, 'P16.2 a zero amount is refused');
+  r = await dsa.post('/api/admin/debts', { full_name: 'A', phone: '1', address: 'X', service: 'Moy', debt_amount: 1000, paid_amount: 5000 });
+  check(r.status === 400, 'P16.2 an opening payment larger than the debt is refused');
+
+  group('P16.3 remaining_amount is derived by the database');
+  r = await dsa.post('/api/admin/debts', {
+    full_name: 'Alisher Karimov', phone: '+998901112233', address: 'Urganch shahri',
+    service: 'Moy almashtirish', description: 'Castrol 5W-30', debt_amount: 500000,
+    // A client trying to dictate the derived column must simply be ignored.
+    remaining_amount: 1, status: 'paid',
+  });
+  const dAli = r.data?.debt;
+  check(r.status === 201 && dAli.remaining_amount === 500000, 'P16.3 remaining_amount comes from the DB, not the client', `got=${dAli && dAli.remaining_amount}`);
+  check(dAli.status === 'unpaid', 'P16.3 status is derived from the amounts, not the request', `got=${dAli && dAli.status}`);
+  r = await dsa.post('/api/admin/debts', { full_name: 'Sevara', phone: '+998902223344', address: 'Xiva', service: 'Diagnostika', debt_amount: 300000, paid_amount: 100000 });
+  const dSev = r.data.debt;
+  check(r.status === 201 && dSev.remaining_amount === 200000 && dSev.status === 'partially_paid', 'P16.3 an opening payment yields partially_paid + correct remainder', `${dSev.status}/${dSev.remaining_amount}`);
+  r = await dsa.get(`/api/admin/debts/${dSev.id}`);
+  check(r.data.payments.length === 1 && Number(r.data.payments[0].amount) === 100000, 'P16.3 the opening payment is also recorded in the payment ledger');
+  check(r.data.audit_logs.some((a) => a.action === 'created'), 'P16.3 creation is audited');
+
+  group('P16.4 Payments');
+  r = await dsa.post(`/api/admin/debts/${dAli.id}/payments`, { amount: 0 });
+  check(r.status === 400, 'P16.4 a zero payment is refused');
+  r = await dsa.post(`/api/admin/debts/${dAli.id}/payments`, { amount: -5000 });
+  check(r.status === 400, 'P16.4 a negative payment is refused');
+  r = await dsa.post(`/api/admin/debts/${dAli.id}/payments`, { amount: 500001 });
+  check(r.status === 400, 'P16.4 paying more than the outstanding amount is refused');
+  r = await dsa.post(`/api/admin/debts/${dAli.id}/payments`, { amount: 200000, note: 'naqd pul' });
+  check(r.status === 201 && r.data.debt.remaining_amount === 300000 && r.data.debt.status === 'partially_paid', 'P16.4 a partial payment updates the debt', `${r.data.debt && r.data.debt.status}`);
+  r = await dsa.post(`/api/admin/debts/${dAli.id}/payments`, { amount: 300000 });
+  check(r.status === 201 && r.data.debt.remaining_amount === 0 && r.data.debt.status === 'paid', 'P16.4 paying the rest settles the debt');
+  r = await dsa.post(`/api/admin/debts/${dAli.id}/payments`, { amount: 1 });
+  check(r.status === 400, 'P16.4 a settled debt accepts no further payment');
+  r = await dsa.get(`/api/admin/debts/${dAli.id}`);
+  check(r.data.payments.length === 2, 'P16.4 every payment is its own row (history is never overwritten)', `n=${r.data.payments.length}`);
+  const paymentSum = r.data.payments.reduce((a, p) => a + Number(p.amount), 0);
+  check(paymentSum === Number(r.data.debt.paid_amount), 'P16.4 SUM(debt_payments) always equals paid_amount', `${paymentSum} vs ${r.data.debt.paid_amount}`);
+  check(r.data.audit_logs.filter((a) => a.action === 'payment_added').length === 2, 'P16.4 each payment is audited');
+
+  group('P16.5 Concurrent payments cannot overshoot');
+  r = await dsa.post('/api/admin/debts', { full_name: 'Parallel', phone: '+998903334455', address: 'Beruniy', service: 'Tormoz', debt_amount: 100000, paid_amount: 0 });
+  const dPar = r.data.debt;
+  const [pA, pB] = await Promise.all([
+    dsa.post(`/api/admin/debts/${dPar.id}/payments`, { amount: 80000 }),
+    dsa.post(`/api/admin/debts/${dPar.id}/payments`, { amount: 80000 }),
+  ]);
+  const settled = [pA, pB].filter((x) => x.status === 201).length;
+  check(settled === 1, 'P16.5 of two concurrent 80% payments exactly one succeeds (FOR UPDATE serialises them)', `${pA.status}/${pB.status}`);
+  r = await dsa.get(`/api/admin/debts/${dPar.id}`);
+  check(Number(r.data.debt.paid_amount) <= 100000, 'P16.5 the debt was never overpaid', `paid=${r.data.debt.paid_amount}`);
+
+  group('P16.6 Search, filter, sort, pagination');
+  const bulk = [
+    ['Qodir Ahmedov', '+998901000001', 'Xiva', 'Moy', 900000],
+    ['Lola Karimova', '+998901000002', 'Urganch', 'Diagnostika', 800000],
+    ['=cmd|calc', '+998901000003', 'Termiz', 'Tormoz', 700000],
+  ];
+  const bulkIds = [];
+  for (const [n, ph, ad, sv, amt] of bulk) {
+    r = await dsa.post('/api/admin/debts', { full_name: n, phone: ph, address: ad, service: sv, debt_amount: amt });
+    bulkIds.push(r.data.debt.id);
+  }
+  r = await dsa.get('/api/admin/debts?q=Lola');
+  check(r.data.debts.length === 1 && r.data.debts[0].id === bulkIds[1], 'P16.6 search matches the name');
+  r = await dsa.get('/api/admin/debts?q=901000002');
+  check(r.data.debts.length === 1, 'P16.6 search matches the phone');
+  r = await dsa.get('/api/admin/debts?q=Termiz');
+  check(r.data.debts.length === 1, 'P16.6 search matches the address');
+  r = await dsa.get('/api/admin/debts?q=Tormoz');
+  check(r.data.debts.length >= 2, 'P16.6 search matches the service');
+  r = await dsa.get('/api/admin/debts?filter=paid');
+  check(r.data.debts.every((d) => d.status === 'paid'), 'P16.6 filter=paid returns only settled debts');
+  r = await dsa.get('/api/admin/debts?filter=unpaid');
+  check(r.data.debts.every((d) => d.remaining_amount > 0), 'P16.6 filter=unpaid returns only debts with an outstanding balance');
+  check(r.data.debts.every((d) => d.status === 'unpaid'), 'P16.6 unpaid and partially_paid are separate filters');
+  r = await dsa.get('/api/admin/debts?filter=partially_paid');
+  check(r.data.debts.every((d) => d.status === 'partially_paid'), 'P16.6 filter=partially_paid works');
+  r = await dsa.get('/api/admin/debts?sort=largest&per_page=100');
+  const amounts = r.data.debts.map((d) => Number(d.debt_amount));
+  check(amounts.every((v, i) => i === 0 || amounts[i - 1] >= v), 'P16.6 sort=largest returns a descending order');
+  r = await dsa.get('/api/admin/debts?sort=remaining&per_page=100');
+  const remaining = r.data.debts.map((d) => Number(d.remaining_amount));
+  check(remaining.every((v, i) => i === 0 || remaining[i - 1] >= v), 'P16.6 sort=remaining sorts by the outstanding balance');
+  r = await dsa.get('/api/admin/debts?sort=%27%3B+DROP+TABLE+debts%3B--');
+  check(r.status === 200, 'P16.6 an unknown sort value is ignored, not interpolated');
+  r = await dsa.get('/api/admin/debts?per_page=5&page=1');
+  const firstPage = r.data.debts.map((d) => d.id);
+  const pg1 = r.data.pagination;
+  check(r.data.debts.length <= 5 && pg1.page === 1, 'P16.6 per_page caps the page size');
+  r = await dsa.get('/api/admin/debts?per_page=5&page=2');
+  check(r.data.pagination.page === 2 && r.data.pagination.total === pg1.total, 'P16.6 pagination reports a stable total');
+  check(r.data.debts.every((d) => !firstPage.includes(d.id)), 'P16.6 page 2 does not repeat page 1');
+  r = await dsa.get('/api/admin/debts?per_page=99999');
+  check(r.data.pagination.per_page <= 100, 'P16.6 per_page cannot be inflated past the cap', `per_page=${r.data.pagination.per_page}`);
+
+  group('P16.7 CSV export');
+  r = await dsa.req('GET', '/api/admin/debts/export.csv');
+  const disp = String(r.headers.get('content-disposition') || '');
+  check(r.status === 200 && /attachment/i.test(disp), 'P16.7 CSV is served as a download, not inline', `status=${r.status} disp=${disp}`);
+  check((r.headers.get('content-type') || '').includes('text/csv'), 'P16.7 CSV has the text/csv content type');
+  const csv = r.buf.toString('utf8');
+  check(csv.split('\r\n')[0].includes('Qolgan'), 'P16.7 the CSV header includes the derived outstanding column');
+  check(csv.includes("'=cmd|calc"), 'P16.7 a formula-looking cell is neutralised with a leading quote', csv.split('\r\n').find((l) => l.includes('cmd')) || '');
+  check(!csv.includes(DEBT_PASS_KEY), 'P16.7 the CSV never contains the pass key');
+
+  group('P16.8 Mark as fully paid');
+  r = await dsa.post('/api/admin/debts', { full_name: 'Mark Test', phone: '+998904445566', address: 'Navoiy', service: 'Filtr', debt_amount: 250000 });
+  const dMark = r.data.debt;
+  r = await dsa.post(`/api/admin/debts/${dMark.id}/payments`, { amount: 50000 });
+  r = await dsa.post(`/api/admin/debts/${dMark.id}/mark-paid`);
+  check(r.status === 200 && r.data.debt.status === 'paid' && r.data.debt.remaining_amount === 0, 'P16.8 mark-paid settles the debt');
+  r = await dsa.get(`/api/admin/debts/${dMark.id}`);
+  const markSum = r.data.payments.reduce((a, p) => a + Number(p.amount), 0);
+  check(markSum === 250000, 'P16.8 mark-paid books the remainder as a payment, so the ledger still reconciles', `sum=${markSum}`);
+  check(r.data.audit_logs.some((a) => a.action === 'marked_paid'), 'P16.8 mark-paid is audited');
+
+  group('P16.9 Only a settled debt can be archived');
+  r = await dsa.post('/api/admin/debts', { full_name: 'Unpaid Guy', phone: '+998905556677', address: 'Xorazm', service: 'Balans', debt_amount: 70000 });
+  const dUnpaid = r.data.debt;
+  r = await dsa.delWithKey(`/api/admin/debts/${dUnpaid.id}`, DEBT_PASS_KEY);
+  check(r.status === 409, 'P16.9 a debt with money outstanding cannot be archived even with the correct pass key', `status=${r.status}`);
+  r = await dsa.get(`/api/admin/debts/${dUnpaid.id}`);
+  check(!r.data.debt.deleted_at, 'P16.9 the refused archive left the row untouched');
+  r = await dsa.delWithKey('/api/admin/debts/999999', DEBT_PASS_KEY);
+  check(r.status === 404, 'P16.9 archiving a non-existent debt 404s', `status=${r.status}`);
+
+  group('P16.10 The pass key is required, and a wrong one is refused');
+  r = await dsa.delWithKey(`/api/admin/debts/${dMark.id}`);
+  check(r.status === 403, 'P16.10 no pass key means no archive', `status=${r.status}`);
+  r = await dsa.delWithKey(`/api/admin/debts/${dMark.id}`, WRONG_DEBT_KEY);
+  check(r.status === 403, 'P16.10 a wrong pass key is refused', `status=${r.status}`);
+  r = await dsa.get(`/api/admin/debts/${dMark.id}`);
+  check(!r.data.debt.deleted_at, 'P16.10 a wrong pass key did not archive anything');
+  check(r.data.audit_logs.some((a) => a.action === 'delete_denied'), 'P16.10 the failed attempt is on record even though the request failed');
+  check(r.data.audit_logs.some((a) => a.action === 'delete_requested'), 'P16.10 the attempt itself is on record before the key was checked');
+  const auditText = JSON.stringify(r.data.audit_logs);
+  check(!auditText.includes(DEBT_PASS_KEY) && !auditText.includes(WRONG_DEBT_KEY), 'P16.10 neither the right nor the wrong key is ever written to the audit log');
+
+  group('P16.11 The correct pass key archives, and the row is kept');
+  r = await dsa.delWithKey(`/api/admin/debts/${dMark.id}`, DEBT_PASS_KEY);
+  check(r.status === 200 && r.data.debt.deleted_at, 'P16.11 the correct pass key archives the debt', `status=${r.status}`);
+  check(!JSON.stringify(r.data).includes(DEBT_PASS_KEY), 'P16.11 the response does not echo the pass key');
+  r = await dsa.get(`/api/admin/debts?filter=archive`);
+  check(r.data.debts.some((d) => d.id === dMark.id), 'P16.11 the archived debt is listed in the archive filter');
+  r = await dsa.get('/api/admin/debts?per_page=100');
+  check(!r.data.debts.some((d) => d.id === dMark.id), 'P16.11 an archived debt disappears from the live list');
+  r = await dsa.get(`/api/admin/debts/${dMark.id}`);
+  check(r.status === 200 && r.data.payments.length === 2, 'P16.11 the archive keeps the full payment history', `n=${r.data.payments.length}`);
+  check(r.data.audit_logs.some((a) => a.action === 'deleted'), 'P16.11 the successful archive is audited');
+  r = await dsa.delWithKey(`/api/admin/debts/${dMark.id}`, DEBT_PASS_KEY);
+  check(r.status === 409, 'P16.11 archiving twice is refused', `status=${r.status}`);
+  r = await dsa.post(`/api/admin/debts/${dMark.id}/payments`, { amount: 100 });
+  check(r.status === 409, 'P16.11 an archived debt accepts no new payments');
+
+  group('P16.12 Purge cannot destroy payment history');
+  r = await dm1.req('POST', `/api/admin/debts/${dAli.id}/purge`, {});
+  check(r.status === 403, 'P16.12 a master cannot purge', `status=${r.status}`);
+  r = await dsa.req('POST', `/api/admin/debts/${dAli.id}/purge`, {});
+  check(r.status === 403, 'P16.12 purge also needs the pass key', `status=${r.status}`);
+  r = await dsa.req('POST', `/api/admin/debts/${dAli.id}/purge`, {}, false, { 'X-Debt-Pass-Key': DEBT_PASS_KEY });
+  check(r.status === 409, 'P16.12 a debt with payment history can never be purged', `status=${r.status}`);
+  r = await dsa.get(`/api/admin/debts/${dAli.id}`);
+  check(r.status === 200 && r.data.payments.length === 2, 'P16.12 its payment rows are all still there after the refused purge', `n=${r.data.payments && r.data.payments.length}`);
+
+  // A settled debt with no payment rows cannot be produced through the API (any
+  // settlement books a payment), so it is inserted directly. This is the only
+  // shape the purge endpoint is allowed to remove, i.e. a mistaken entry that
+  // never received money.
+  const mainDb = legacyClient(PG_DB);
+  await mainDb.connect();
+  const typoIns = await mainDb.query(
+    `INSERT INTO debts (full_name, phone, address, service, debt_amount, paid_amount, status)
+     VALUES ('Typo Entry', '+998907778899', 'Nukus', 'Xatolik', 1000, 1000, 'paid') RETURNING id`
+  );
+  const dTypoId = typoIns.rows[0].id;
+  await mainDb.end();
+  r = await dsa.req('POST', `/api/admin/debts/${dTypoId}/purge`, {}, false, { 'X-Debt-Pass-Key': DEBT_PASS_KEY });
+  check(r.status === 200, 'P16.12 a payment-less mistake can be purged by a super admin', `status=${r.status}`);
+  r = await dsa.get(`/api/admin/debts/${dTypoId}`);
+  check(r.status === 404, 'P16.12 the purged row is really gone from debts', `status=${r.status}`);
+  r = await dsa.get('/api/admin/debts/stats');
+  check(r.status === 200 && r.data.archived >= 1, 'P16.12 the archive counter reflects the soft deletes');
+
+  group('P16.13 Purge needs the pass key even from a fresh admin session');
+  r = await dsa.post(`/api/admin/debts/${bulkIds[0]}/purge`, {}, false, { 'X-Debt-Pass-Key': DEBT_PASS_KEY });
+  check(r.status === 409, 'P16.13 an unsettled debt is refused before the key is even considered', `status=${r.status}`);
+  r = await dsa.get(`/api/admin/debts/${bulkIds[0]}`);
+  check(r.status === 200, 'P16.13 and it is still readable');
+
+  group('P16.14 Failed delete attempts are rate limited');
+  // A correct-key archive clears the failure budget, so this group starts from a
+  // known-empty counter rather than inheriting the attempts made above.
+  r = await dsa.post('/api/admin/debts', { full_name: 'Reset Budget', phone: '+998908889900', address: 'Buxoro', service: 'Filtr', debt_amount: 5000 });
+  const dReset = r.data.debt;
+  await dsa.post(`/api/admin/debts/${dReset.id}/mark-paid`);
+  r = await dsa.delWithKey(`/api/admin/debts/${dReset.id}`, DEBT_PASS_KEY);
+  check(r.status === 200, 'P16.14 a correct-key archive succeeds before the limiter test', `status=${r.status}`);
+  const limiter = [];
+  for (let i = 0; i < 6; i++) {
+    limiter.push((await dsa.delWithKey(`/api/admin/debts/${dAli.id}`, WRONG_DEBT_KEY)).status);
+  }
+  check(limiter.slice(0, 5).every((s) => s === 403), 'P16.14 the first five wrong keys are refused with 403', JSON.stringify(limiter));
+  check(limiter[5] === 429, 'P16.14 the sixth attempt is rate limited', JSON.stringify(limiter));
+  r = await dsa.delWithKey(`/api/admin/debts/${dAli.id}`, DEBT_PASS_KEY);
+  check(r.status === 429, 'P16.14 the limit holds even for the correct key until the window passes', `status=${r.status}`);
+  r = await dsa.get('/api/admin/debts');
+  check(r.status === 200, 'P16.14 the limit is scoped to deletion and does not block the rest of the ledger', `status=${r.status}`);
+  r = await dsa.post(`/api/admin/debts/${dUnpaid.id}/payments`, { amount: 1000 });
+  check(r.status === 201, 'P16.14 payments still work while the delete limiter is closed', `status=${r.status}`);
+
+  group('P16.15 Dashboard statistics come from the ledger');
+  r = await dsa.get('/api/admin/dashboard');
+  const ledgerStats = (await dsa.get('/api/admin/debts/stats')).data;
+  check(r.status === 200 && r.data.stats.debtTotalDebtors === ledgerStats.totalDebtors, 'P16.15 the dashboard debtor count matches the ledger', `${r.data.stats && r.data.stats.debtTotalDebtors} vs ${ledgerStats.totalDebtors}`);
+  check(r.data.stats.debtOutstanding === ledgerStats.totalRemaining, 'P16.15 the dashboard outstanding total matches the ledger', `${r.data.stats && r.data.stats.debtOutstanding} vs ${ledgerStats.totalRemaining}`);
+  const anonStats = await anonD.get('/api/admin/dashboard');
+  check(anonStats.status === 401, 'P16.15 the dashboard figures are not public', `status=${anonStats.status}`);
+
+  group('P16.16 Editing a debt');
+  r = await dsa.patch(`/api/admin/debts/${dSev.id}`, { service: 'Diagnostika + skener' });
+  check(r.status === 200 && r.data.debt.service === 'Diagnostika + skener', 'P16.16 fields can be edited', `status=${r.status}`);
+  check(Number(r.data.debt.remaining_amount) === 200000, 'P16.16 editing a non-amount field never disturbs the balance', `got=${r.data.debt && r.data.debt.remaining_amount}`);
+  r = await dsa.patch(`/api/admin/debts/${dSev.id}`, { paid_amount: 0 });
+  check(r.status === 200 && Number(r.data.debt.paid_amount) === 100000, 'P16.16 paid_amount is not editable directly, only through payments', `paid=${r.data.debt && r.data.debt.paid_amount}`);
+  r = await dsa.patch(`/api/admin/debts/${dSev.id}`, { debt_amount: 50000 });
+  check(r.status === 400, 'P16.16 the debt cannot be shrunk below what is already paid', `status=${r.status}`);
+  r = await dsa.patch(`/api/admin/debts/${dMark.id}`, { service: 'no' });
+  check(r.status === 409, 'P16.16 an archived debt cannot be edited', `status=${r.status}`);
+  r = await dsa.patch('/api/admin/debts/999999', { service: 'x' });
+  check(r.status === 404, 'P16.16 editing a non-existent debt 404s');
+
+  group('P16.17 Deletion fails closed when the pass key is not configured');
+  // A second instance pointed at the same database, started *without*
+  // DEBT_DELETE_PASS_KEY. The point of this group is that a missing setting must
+  // refuse deletion rather than quietly allowing it.
+  const nokeyPort = PORT + 3;
+  const nokeyBase = `http://127.0.0.1:${nokeyPort}`;
+  const nokeyEnv = serverEnv({ PORT: String(nokeyPort) });
+  delete nokeyEnv.DEBT_DELETE_PASS_KEY;
+  const nokey = spawn(process.execPath, [ENTRY], { env: nokeyEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  extraChildren.push(nokey);
+  const nokeyLogs = [];
+  nokey.stdout.on('data', (d) => nokeyLogs.push(d.toString()));
+  nokey.stderr.on('data', (d) => nokeyLogs.push(d.toString()));
+
+  let nokeyReady = false;
+  for (let i = 0; i < 150 && !nokeyReady; i++) {
+    const res = await get('/api/health', nokeyBase);
+    nokeyReady = res.status === 200;
+    if (!nokeyReady) await new Promise((r2) => setTimeout(r2, 200));
+  }
+  check(nokeyReady, 'P16.17 the pass-key-less instance boots', nokeyLogs.join('').slice(-400));
+
+  if (nokeyReady) {
+    // Bound to the pass-key-less instance, not the default BASE.
+    const nc = newClient(nokeyBase);
+    let nl = await nc.req('POST', '/api/auth/login', { username: 'superadmin1', password: 'password123' });
+    check(nl.status === 200, 'P16.17 an admin can sign in there', `status=${nl.status}`);
+
+    // dAli is settled (P16.4) and not archived, so it is a valid purge candidate
+    // except that it has payments. Use dSev's archive instead: settle a debt on
+    // this instance first so the target is definitely deletable in principle.
+    nl = await nc.req('POST', '/api/admin/debts', { full_name: 'Fail Closed', phone: '+998909990011', address: 'Buxoro', service: 'Filtr', debt_amount: 3000 });
+    const fcId = nl.data.debt.id;
+    await nc.req('POST', `/api/admin/debts/${fcId}/mark-paid`);
+
+    nl = await nc.req('DELETE', `/api/admin/debts/${fcId}`, undefined, false, { 'X-Debt-Pass-Key': DEBT_PASS_KEY });
+    check(nl.status === 503, 'P16.17 with no DEBT_DELETE_PASS_KEY set, deletion is refused with 503', `status=${nl.status}`);
+    nl = await nc.req('DELETE', `/api/admin/debts/${fcId}`, undefined, false, {});
+    check(nl.status === 503, 'P16.17 sending no key is refused too, rather than treated as "no key needed"', `status=${nl.status}`);
+    nl = await nc.req('GET', `/api/admin/debts/${fcId}`);
+    check(!nl.data.debt.deleted_at, 'P16.17 the debt was NOT archived by the unconfigured instance');
+    const nokeyLogText = nokeyLogs.join('');
+    check(!nokeyLogText.includes(DEBT_PASS_KEY), 'P16.17 nothing about the key reaches the logs');
+  }
+  nokey.kill('SIGTERM');
 }
 
 try {

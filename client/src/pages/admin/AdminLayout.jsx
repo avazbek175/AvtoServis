@@ -17,6 +17,7 @@ const NAV = [
   { to: '/admin/applications', icon: 'document', label: 'Usta arizalari', adminOnly: true },
   { to: '/admin/users', icon: 'user', label: 'Ustalar', adminOnly: true },
   { to: '/admin/worklogs', icon: 'document', label: 'Bajarilgan ishlar' },
+  { to: '/admin/debts', icon: 'money', label: 'Qarz daftari' },
   { to: '/admin/media', icon: 'image', label: 'Media / Rasmlar' },
 ];
 

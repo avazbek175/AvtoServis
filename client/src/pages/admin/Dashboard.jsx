@@ -10,6 +10,7 @@ const CARDS = [
   { title: 'Xizmatlar', to: '/admin/services', icon: 'wrench', color: 'text-red-400 bg-red-500/10' },
   { title: 'Sayt sozlamalari', to: '/admin/settings', icon: 'settings', color: 'text-emerald-400 bg-emerald-500/10' },
   { title: 'Media / Rasmlar', to: '/admin/media', icon: 'image', color: 'text-amber-400 bg-amber-500/10' },
+  { title: 'Qarz daftari', to: '/admin/debts', icon: 'money', color: 'text-red-400 bg-red-500/10' },
 ];
 
 export default function Dashboard() {
@@ -37,6 +38,12 @@ export default function Dashboard() {
       ? [{ label: 'Ustalar', value: stats.masters, icon: 'user', color: 'bg-sky-500', to: '/admin/users' }]
       : []),
     { label: 'Yuklangan rasmlar', value: stats.mediaCount, icon: 'image', color: 'bg-amber-500', to: '/admin/media' },
+    // Debt figures come from the ledger itself (real SUM() over the rows), never
+    // from the frontend, so they cannot be faked or stale.
+    { label: 'Qarzdorlar', value: stats.debtTotalDebtors ?? 0, icon: 'user', color: 'bg-red-500', to: '/admin/debts' },
+    { label: 'Jami qarz', value: stats.debtTotal, icon: 'money', color: 'bg-[rgb(var(--c-primary))]', to: '/admin/debts' },
+    { label: "To'lanmagan qarz", value: stats.debtOutstanding, icon: 'clock', color: 'bg-amber-500', to: '/admin/debts' },
+    { label: "Bugungi yangi qarz", value: stats.debtCreatedToday, icon: 'calendar', color: 'bg-sky-500', to: '/admin/debts' },
   ];
 
   return (

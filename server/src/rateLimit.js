@@ -114,12 +114,84 @@ function recordSuccess(req) {
   clear(accountBucket(accountKey(req)));
 }
 
+/**
+ * Rate limiting for the debt-ledger delete/purge endpoints.
+ *
+ * Separate buckets from the login limiter on purpose: the debt pass key is a
+ * single shared secret, so the budget for guessing it must not be spendable
+ * through failed logins, and a lockout on login must not block an admin from
+ * finishing a legitimate deletion (or vice versa).
+ *
+ * Only *failed* attempts count, so the guard never blocks an admin who has the
+ * right key. Two independent buckets are used:
+ *   - per admin session: stops one authenticated account from grinding the key
+ *   - per IP: stops the same guess being replayed from many sessions
+ */
+const DEBT_DELETE_WINDOW_MS = () => positiveInt(process.env.DEBT_DELETE_RATE_WINDOW_MS, 15 * 60 * 1000);
+const DEBT_DELETE_MAX = () => positiveInt(process.env.DEBT_DELETE_RATE_LIMIT_MAX, 5);
+
+function debtDeleteBucketMax() {
+  return DEBT_DELETE_MAX();
+}
+
+function debtAdminBucket(userId) {
+  return `debtdelete:admin:${userId == null ? 'anon' : userId}`;
+}
+
+function debtIpBucket(ip) {
+  return `debtdelete:ip:${ip}`;
+}
+
+/** Middleware guarding debt deletion and purging. */
+function debtDeleteRateLimit(req, res, next) {
+  const now = Date.now();
+  if (buckets.size > 5000) prune(now);
+
+  const keys = [debtIpBucket(clientIp(req)), debtAdminBucket(req.user && req.user.id)];
+  const blocked = keys
+    .map((k) => ({ key: k, count: buckets.get(k) ? buckets.get(k).count : 0, resetAt: buckets.get(k) ? buckets.get(k).resetAt : 0 }))
+    .filter((s) => s.resetAt > now && s.count >= debtDeleteBucketMax())
+    .find(Boolean);
+
+  if (blocked) {
+    const retryAfterSec = Math.max(1, Math.ceil((blocked.resetAt - now) / 1000));
+    res.set('Retry-After', String(retryAfterSec));
+    return res.status(429).json({
+      error: 'Juda ko\'p urinish. Biroz kutib turing va qayta yuboring.',
+      retryAfter: retryAfterSec,
+    });
+  }
+  next();
+}
+
+/** Call after a rejected pass key. */
+function recordDebtDeleteFailure(req) {
+  const now = Date.now();
+  hit(debtIpBucket(clientIp(req)), now);
+  hit(debtAdminBucket(req.user && req.user.id), now);
+}
+
+/** Call after a correct pass key, to clear the failure budget. */
+function recordDebtDeleteSuccess(req) {
+  clear(debtAdminBucket(req.user && req.user.id));
+  clear(debtIpBucket(clientIp(req)));
+}
+
 module.exports = {
   loginRateLimit,
   recordFailure,
   recordSuccess,
   clientIp,
   accountKey,
-  limits: { accountMax: ACCOUNT_MAX, ipMax: IP_MAX, windowMs: WINDOW_MS },
+  debtDeleteRateLimit,
+  recordDebtDeleteFailure,
+  recordDebtDeleteSuccess,
+  limits: {
+    accountMax: ACCOUNT_MAX,
+    ipMax: IP_MAX,
+    windowMs: WINDOW_MS,
+    debtDeleteMax: DEBT_DELETE_MAX,
+    debtDeleteWindowMs: DEBT_DELETE_WINDOW_MS,
+  },
   __reset: () => buckets.clear(),
 };
