@@ -5,8 +5,9 @@ import { useSite } from '../../store';
 import { api } from '../../api';
 import Icon from '../../components/icons';
 import { Alert, Spinner } from '../../components/ui';
+import { SERVICE_NAMES } from '../../serviceCatalog';
 
-const SPECIALTIES = ['Mator xodovoy', 'Diagnostika', 'Programma', 'Elektrik', 'Moy almashtirish'];
+const SPECIALTIES = SERVICE_NAMES;
 
 export default function AdminLogin() {
   const { user, login, setUser } = useAdmin();

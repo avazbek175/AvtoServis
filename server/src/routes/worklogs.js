@@ -11,7 +11,14 @@ const router = require('../asyncRoute').wrapRouter(express.Router());
 router.use(auth.authenticate);
 
 const WORK_DIR = require('../paths').workDir;
-const SERVICE_TYPES = ['Mator xodovoy', 'Diagnostika', 'Programma', 'Elektrik', 'Moy almashtirish'];
+// The service catalogue offered when filing work. Mirrors `services.name` and the
+// client's SERVICE_NAMES in client/src/serviceCatalog.js; the pair is asserted by
+// the P20 test groups. "Mator xodovoy" used to be a single combined option -- it is
+// now two services, because an engine job and a chassis job are not the same work.
+const SERVICE_TYPES = ['Mator', 'Xodovoy', 'Diagnostika', 'Programma', 'Elektrik', 'Moy almashtirish'];
+// Kept only so work logs filed under the old combined label can still be read and
+// edited. Never accepted as a new value.
+const LEGACY_SERVICE_TYPE = 'Mator xodovoy';
 const STATUSES = ['Jarayonda', 'Tugallangan'];
 const MAX_WORK_IMAGES = 15;
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
@@ -182,14 +189,32 @@ const workUpload = multer({
   },
 });
 
-function validateWorkBody(b) {
+/**
+ * @param {object} b request body
+ * @param {string} [previousServiceType] value already stored on the row, for the
+ *   PUT path. It lets a log filed under a since-retired service keep being edited
+ *   without being reclassified; it never lets a NEW value through.
+ */
+function validateWorkBody(b, previousServiceType) {
   const service_type = String(b.service_type || '').trim();
   const status = String(b.status || 'Jarayonda').trim();
   const price = Number(b.price === '' || b.price === null || b.price === undefined ? 0 : b.price);
   const title = String(b.title || '').trim();
   if (!title) return { error: 'Ish nomi kiritilishi shart' };
   if (title.length > 200) return { error: 'Ish nomi juda uzun' };
-  if (!SERVICE_TYPES.includes(service_type)) return { error: 'Xizmat turi noto\'g\'ri' };
+  // An unchanged service_type is always accepted -- including the retired
+  // "Mator xodovoy" -- so editing the price or status of an old log does not force
+  // the master to re-classify work they did not touch. Anything that does change
+  // has to be a service offered today, which is what stops the retired combined
+  // name from being written again.
+  if (service_type !== previousServiceType && !SERVICE_TYPES.includes(service_type)) {
+    return {
+      error:
+        service_type === LEGACY_SERVICE_TYPE
+          ? `Xizmat turi noto'g'ri: "${LEGACY_SERVICE_TYPE}" endi Mator va Xodovoy deb ikkiga ajratildi`
+          : "Xizmat turi noto'g'ri",
+    };
+  }
   if (!STATUSES.includes(status)) return { error: 'Ish holati noto\'g\'ri' };
   if (!Number.isFinite(price) || price < 0 || price > 1e12) return { error: 'Narx noto\'g\'ri' };
   const clean = (v, n) => String(v || '').trim().slice(0, n);
@@ -349,7 +374,7 @@ router.put('/:id', async (req, res) => {
   if ('is_public' in b && !isSA(req.user) && toFlag(b.is_public) !== currentPublic) {
     return res.status(403).json({ error: 'Faqat super admin saytda ko\'rsatishni sozlashi mumkin' });
   }
-  const v = validateWorkBody(b);
+  const v = validateWorkBody(b, work.service_type);
   if (v.error) return res.status(400).json({ error: v.error });
   const isPublic = 'is_public' in b ? toFlag(b.is_public) : currentPublic;
   // Must be awaited: the response body is re-read from the database right after,

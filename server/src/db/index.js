@@ -113,12 +113,19 @@ async function seed() {
 
         const { rows } = await client.query('SELECT COUNT(*) AS c FROM services');
         if (Number(rows[0].c) === 0) {
+          // The catalogue, not a hard-coded list of screens. Mator and Xodovoy are
+          // two services: an engine job and a chassis job are priced, parts and
+          // debts differently, so offering them as one "Mator xodovoy" entry made
+          // the shop pick a single wrong label for both. The retired combined name
+          // is deliberately absent -- migration 006 deactivates it on databases
+          // that already carry it, and this list is what a new database gets.
           const services = [
-            ['Mator xodovoy', 'Dvigatel va xodovoy qismlarni ta\'mirlash bo\'yicha to\'liq xizmat: kapital va joriy ta\'mirlash, moy va filtrlarni almashtirish.', 'Sifatli ehtiyot qismlar|Kafolatli ta\'mirlash|Tajribali ustalar', '', 'engine', '', 1],
-            ['Diagnostika', 'Komputer diagnostikasi yordamida avtomobilingizning barcha tizimlarini tekshiramiz.', 'Xatolarni aniq aniqlash|Tezkor natija|Sizga qulay vaqt', '', 'diagnostic', '', 2],
-            ['Programma', 'Avtomobil tizimlarini sozlash, chip tuning va dasturiy ta\'minotni yangilash xizmatlari.', 'Quvvat oshishi|Yoqilgan\'i tejalishi|Tizim barqarorligi', '', 'chip', '', 3],
-            ['Elektrik', 'Avtomobil elektr qismlarini diagnostika qilish va ta\'mirlash: starter, generator, simlar.', 'Zamonaviy uskunalar|Aniq sababni topish|Ishonchli ta\'mirlash', '', 'bolt', '', 4],
-            ['Moy almashtirish', 'Dvigatel moyi va filtrlarni tez va sifatli almashtirish. Barcha turdagi moylar.', 'Moy turini tanlashda yordam|Tez xizmat|Toza ish joyi', '', 'oil', '', 5],
+            ['Mator', 'Dvigatel ta\'mirlash: kapital va joriy ta\'mirlash, moy va filtrlarni almashtirish.', 'Sifatli ehtiyot qismlar|Kafolatli ta\'mirlash|Tajribali ustalar', '', 'engine', '', 1],
+            ['Xodovoy', 'Xodovoy qismlar ta\'mirlash: asosiy qism, amortizator, rul va tormoz tizimlari.', 'Kuchli suspensiya|Aniq diagnostika|Ishonchli ta\'mirlash', '', 'wrench', '', 2],
+            ['Diagnostika', 'Komputer diagnostikasi yordamida avtomobilingizning barcha tizimlarini tekshiramiz.', 'Xatolarni aniq aniqlash|Tezkor natija|Sizga qulay vaqt', '', 'diagnostic', '', 3],
+            ['Programma', 'Avtomobil tizimlarini sozlash, chip tuning va dasturiy ta\'minotni yangilash xizmatlari.', 'Quvvat oshishi|Yoqilgan\'i tejalishi|Tizim barqarorligi', '', 'chip', '', 4],
+            ['Elektrik', 'Avtomobil elektr qismlarini diagnostika qilish va ta\'mirlash: starter, generator, simlar.', 'Zamonaviy uskunalar|Aniq sababni topish|Ishonchli ta\'mirlash', '', 'bolt', '', 5],
+            ['Moy almashtirish', 'Dvigatel moyi va filtrlarni tez va sifatli almashtirish. Barcha turdagi moylar.', 'Moy turini tanlashda yordam|Tez xizmat|Toza ish joyi', '', 'oil', '', 6],
           ];
           for (const s of services) {
             await client.query(

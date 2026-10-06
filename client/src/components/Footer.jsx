@@ -2,6 +2,7 @@ import React from 'react';
 import { Link } from 'react-router-dom';
 import { useSite } from '../store';
 import Icon from './icons';
+import { SERVICE_NAMES } from '../serviceCatalog';
 
 export default function Footer() {
   const { settings } = useSite();
@@ -43,7 +44,7 @@ export default function Footer() {
           <div>
             <h4 className="mb-4 text-sm font-bold uppercase tracking-wider text-white/70">Xizmatlar</h4>
             <ul className="space-y-2.5 text-sm text-white/55">
-              {['Mator xodovoy', 'Diagnostika', 'Programma', 'Elektrik', 'Moy almashtirish'].map((n) => (
+              {SERVICE_NAMES.map((n) => (
                 <li key={n}>
                   <a href="#services" className="transition-colors hover:text-[rgb(var(--c-primary))]">{n}</a>
                 </li>

@@ -2,14 +2,8 @@
 import { api } from '../api';
 import Icon from './icons';
 import { SectionTitle } from './ui';
+import { serviceIcon } from '../serviceCatalog';
 
-const SERVICE_ICONS = {
-  'Mator xodovoy': 'engine',
-  Diagnostika: 'diagnostic',
-  Programma: 'chip',
-  Elektrik: 'bolt',
-  'Moy almashtirish': 'oil',
-};
 
 export default function WorkGallery() {
   const [data, setData] = useState(null);
@@ -53,7 +47,7 @@ export default function WorkGallery() {
                 ) : (
                   <div className="flex h-52 items-center justify-center bg-gradient-to-br from-[rgb(var(--c-secondary))] to-[#182136]">
                     <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[rgb(var(--c-primary))]/15 text-[rgb(var(--c-primary))] ring-1 ring-[rgb(var(--c-primary))]/25">
-                      <Icon name={SERVICE_ICONS[w.service_type] || 'wrench'} size={30} />
+                      <Icon name={serviceIcon(w.service_type)} size={30} />
                     </span>
                   </div>
                 )}
@@ -61,7 +55,7 @@ export default function WorkGallery() {
                 <div className="p-5">
                   <div className="flex items-start justify-between gap-3">
                     <h3 className="font-bold text-white transition-colors group-hover:text-[rgb(var(--c-primary))]">{w.title}</h3>
-                    <Badge icon={SERVICE_ICONS[w.service_type]}>{w.service_type}</Badge>
+                    <Badge icon={serviceIcon(w.service_type)}>{w.service_type}</Badge>
                   </div>
                   {(w.car_brand || w.car_model) && (
                     <p className="mt-1.5 text-sm text-white/60">Avtomobil: {[w.car_brand, w.car_model].filter(Boolean).join(' ')}</p>

@@ -200,7 +200,7 @@ function ServiceForm({ initial, onClose, onSaved }) {
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
             <label className="label">Xizmat nomi *</label>
-            <input className="field" value={form.name} onChange={set('name')} placeholder="Masalan: Mator xodovoy" required />
+            <input className="field" value={form.name} onChange={set('name')} placeholder="Masalan: Xodovoy" required />
           </div>
           <div>
             <label className="label">Narxi (ixtiyoriy)</label>

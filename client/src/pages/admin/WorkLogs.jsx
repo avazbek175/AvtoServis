@@ -3,8 +3,9 @@ import { api } from '../../api';
 import { useAdmin } from '../../store';
 import Icon from '../../components/icons';
 import { Loading, Alert, Badge, Modal, Toggle, ConfirmDialog, EmptyState, Spinner } from '../../components/ui';
+import { SERVICE_NAMES } from '../../serviceCatalog';
 
-const SERVICE_TYPES = ['Mator xodovoy', 'Diagnostika', 'Programma', 'Elektrik', 'Moy almashtirish'];
+const SERVICE_TYPES = SERVICE_NAMES;
 const STATUSES = ['Jarayonda', 'Tugallangan'];
 
 function fmt(c) {

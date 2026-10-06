@@ -56,6 +56,19 @@ function statusFor(debtAmount, paidAmount) {
   return 'partially_paid';
 }
 
+/**
+ * Names the shop currently offers, for validating a changed `service`.
+ *
+ * Read on demand rather than cached: the catalogue is edited from the admin
+ * panel, and a stale cache would let a deactivated service keep being selected.
+ * A retired service is still acceptable on a row that already carries it -- see
+ * the caller -- so historical debts are never stranded.
+ */
+async function activeServiceNames(t) {
+  const rows = await t.prepare('SELECT name FROM services WHERE is_active = 1').all();
+  return new Set(rows.map((r) => r.name));
+}
+
 // ---------------------------------------------------------------------------
 // Search / filter / sort / pagination
 // ---------------------------------------------------------------------------
@@ -524,31 +537,61 @@ router.get('/:id', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const existing = await db.prepare(`SELECT ${DEBT_FIELDS} FROM debts WHERE id = ?`).get(id);
-  if (!existing) return res.status(404).json({ error: 'Qarz topilmadi' });
-  if (existing.deleted_at) return res.status(409).json({ error: 'Arxivdagi qarzni tahrirlash mumkin emas' });
+  // Cheap existence/archived check outside the transaction so a wrong id and an
+  // archived row answer with 404/409 instead of rolling anything back. It is not
+  // authoritative: the row is re-read under FOR UPDATE below before anything is
+  // written, because this read takes no lock and a payment can land in between.
+  const seen = await db.prepare(`SELECT ${DEBT_FIELDS} FROM debts WHERE id = ?`).get(id);
+  if (!seen) return res.status(404).json({ error: 'Qarz topilmadi' });
+  if (seen.deleted_at) return res.status(409).json({ error: 'Arxivdagi qarzni tahrirlash mumkin emas' });
 
   const body = req.body || {};
-  const full_name = 'full_name' in body ? text(body.full_name, 'Ism-familiya', { required: true, max: 200 }) : existing.full_name;
-  const phone = 'phone' in body ? text(body.phone, 'Telefon', { required: true, max: 60 }) : existing.phone;
-  const service = 'service' in body ? text(body.service, 'Xizmat', { required: true, max: 300 }) : existing.service;
-  const description = 'description' in body ? text(body.description, 'Izoh', { max: 4000 }) : existing.description;
-
-  // `address` in the body is ignored, for the same reason as on create. It is also
-  // absent from the UPDATE below, so a value already stored on the row is left
-  // untouched rather than blanked out.
-  const debt_amount = 'debt_amount' in body ? parseAmount(body.debt_amount, 'Qarz') : Number(existing.debt_amount);
-  if (debt_amount <= 0) throw badRequest("Qarz summasi 0 dan katta bo'lishi kerak");
-
-  // paid_amount is intentionally NOT editable here: it only ever moves through a
-  // payment or mark-paid, so the payment ledger stays a complete history.
-  const paid_amount = Number(existing.paid_amount);
-  if (paid_amount > debt_amount) {
-    throw badRequest("Qarzni kamaytirish mumkin emas: to'langan summa yangi qarz summasidan katta bo'lib ketadi");
-  }
-  const status = statusFor(debt_amount, paid_amount);
 
   const debt = await db.transaction(async (t) => {
+    // The lock is the whole point of this read. Without it two admins editing the
+    // same debt, or an edit racing a payment, would each compute a status from a
+    // paid_amount they read before the other committed. Every payment endpoint
+    // already locks the same way, so both sides serialise here too.
+    const current = await t
+      .prepare(`SELECT ${DEBT_FIELDS} FROM debts WHERE id = ? FOR UPDATE`)
+      .one(id);
+    if (!current) return null;
+    // Re-checked under the lock: the row could have been archived while this
+    // request waited.
+    if (current.deleted_at) {
+      const err = new Error('Arxivdagi qarzni tahrirlash mumkin emas');
+      err.status = 409;
+      throw err;
+    }
+
+    const full_name = 'full_name' in body ? text(body.full_name, 'Ism-familiya', { required: true, max: 200 }) : current.full_name;
+    const phone = 'phone' in body ? text(body.phone, 'Telefon', { required: true, max: 60 }) : current.phone;
+    const description = 'description' in body ? text(body.description, 'Izoh', { max: 4000 }) : current.description;
+    let service = 'service' in body ? text(body.service, 'Xizmat', { required: true, max: 300 }) : current.service;
+    // A changed service has to be one the shop actually offers. Leaving the field
+    // alone is always allowed, so a debt recorded under a name that has since been
+    // retired (or typed in by hand) can still have its amount fixed -- the edit
+    // form never silently rewrites a service the operator did not touch.
+    if (service !== current.service) {
+      const active = await activeServiceNames(t);
+      if (!active.has(service)) throw badRequest("Xizmat ro'yxatdan tanlanishi kerak");
+    }
+
+    // `address` in the body is ignored, for the same reason as on create. It is also
+    // absent from the UPDATE below, so a value already stored on the row is left
+    // untouched rather than blanked out.
+    const debt_amount = 'debt_amount' in body ? parseAmount(body.debt_amount, 'Qarz') : Number(current.debt_amount);
+    if (debt_amount <= 0) throw badRequest("Qarz summasi 0 dan katta bo'lishi kerak");
+
+    // paid_amount is intentionally NOT editable here: it only ever moves through a
+    // payment or mark-paid, so the payment ledger stays a complete history. It is
+    // re-read from the locked row, never from the request body.
+    const paid_amount = Number(current.paid_amount);
+    if (paid_amount > debt_amount) {
+      throw badRequest("Qarzni kamaytirish mumkin emas: to'langan summa yangi qarz summasidan katta bo'lib ketadi");
+    }
+    const status = statusFor(debt_amount, paid_amount);
+
     const updated = await t
       .prepare(
         `UPDATE debts SET full_name = ?, phone = ?, service = ?, description = ?,
@@ -556,10 +599,11 @@ router.patch('/:id', async (req, res) => {
          WHERE id = ? RETURNING ${DEBT_FIELDS}`
       )
       .one(full_name, phone, service, description, debt_amount, status, id);
-    await audit(t, req, id, 'updated', { before: snapshot(existing), after: snapshot(updated) });
+    await audit(t, req, id, 'updated', { before: snapshot(current), after: snapshot(updated) });
     return updated;
   });
 
+  if (!debt) return res.status(404).json({ error: 'Qarz topilmadi' });
   res.json({ debt: { ...debt, status_label: STATUS_UZ[debt.status] || debt.status } });
 });
 

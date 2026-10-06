@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../../api';
 import Icon from '../../components/icons';
 import { Loading, Alert, Badge, Modal, ConfirmDialog } from '../../components/ui';
+import { serviceOptions } from '../../serviceCatalog';
 
 const STATUS_META = {
   unpaid: { label: "To'lanmagan", badge: 'danger', row: 'bg-red-500/[0.04]' },
@@ -46,6 +47,7 @@ export default function DebtLedger() {
   const [currentPage, setCurrentPage] = useState(1);
 
   const [addOpen, setAddOpen] = useState(false);
+  const [editFor, setEditFor] = useState(null);
   const [payFor, setPayFor] = useState(null);
   const [historyFor, setHistoryFor] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
@@ -210,6 +212,7 @@ export default function DebtLedger() {
                             debt={d}
                             archived={archived}
                             onPay={() => setPayFor(d)}
+                            onEdit={() => setEditFor(d)}
                             onHistory={() => setHistoryFor(d)}
                             onDelete={() => setDeleteTarget(d)}
                           />
@@ -247,6 +250,7 @@ export default function DebtLedger() {
                       debt={d}
                       archived={archived}
                       onPay={() => setPayFor(d)}
+                      onEdit={() => setEditFor(d)}
                       onHistory={() => setHistoryFor(d)}
                       onDelete={() => setDeleteTarget(d)}
                     />
@@ -271,6 +275,7 @@ export default function DebtLedger() {
       )}
 
       <AddDebtModal open={addOpen} onClose={() => setAddOpen(false)} onSaved={async () => { setAddOpen(false); setNotice("Qarz daftarga qo'shildi"); await load(); }} />
+      <EditDebtModal debt={editFor} onClose={() => setEditFor(null)} onSaved={async () => { setEditFor(null); setNotice("Qarz ma'lumotlari yangilandi."); await load(); }} />
       <PaymentModal debt={payFor} onClose={() => setPayFor(null)} onSaved={load} />
       <HistoryModal debt={historyFor} onClose={() => setHistoryFor(null)} />
       <DeleteModal debt={deleteTarget} onClose={() => setDeleteTarget(null)} onDone={onDeleted} />
@@ -278,13 +283,18 @@ export default function DebtLedger() {
   );
 }
 
-function RowActions({ debt, archived, onPay, onHistory, onDelete }) {
+function RowActions({ debt, archived, onPay, onEdit, onHistory, onDelete }) {
   const unpaid = Number(debt.remaining_amount) > 0;
   return (
     <div className="flex items-center gap-1.5">
       {!archived && unpaid && (
         <button type="button" onClick={onPay} className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/20">
           <Icon name="money" size={14} /> To'lov
+        </button>
+      )}
+      {!archived && (
+        <button type="button" onClick={onEdit} className="rounded-lg border border-white/10 p-1.5 text-white/60 transition hover:bg-white/10" title="Tahrirlash">
+          <Icon name="edit" size={14} />
         </button>
       )}
       <button type="button" onClick={onHistory} className="rounded-lg border border-white/10 p-1.5 text-white/60 transition hover:bg-white/10" title="Tarix">
@@ -349,6 +359,32 @@ function ExcelExportButton({ filter, sort, search, onError }) {
   );
 }
 
+/**
+ * Service picker shared by the add and edit forms.
+ *
+ * A free-text field let the ledger collect "Moy", "Balans" and "Tormoz" for what
+ * is really the same three services, and it is the field a debt is grouped and
+ * read by. The list is the shop's catalogue, in one place
+ * (client/src/serviceCatalog.js), so the form, the footer and the work-log form
+ * cannot drift apart.
+ *
+ * A value already on a record but no longer in the catalogue is appended, marked
+ * "(eski)". Dropping it would make the select render blank for a debt the operator
+ * never touched, and saving would silently rewrite the service -- so the old name
+ * is offered back and only changes if somebody actively picks a new one.
+ */
+function ServiceSelect({ value, onChange, required = false, disabled = false }) {
+  const options = serviceOptions(value);
+  return (
+    <select className="field" value={value} onChange={onChange} required={required} disabled={disabled}>
+      <option value="" disabled className="bg-[#111725]">[Xizmatni tanlang ▼]</option>
+      {options.map((o) => (
+        <option key={o.value} value={o.value} className="bg-[#111725]">{o.label}</option>
+      ))}
+    </select>
+  );
+}
+
 function AddDebtModal({ open, onClose, onSaved }) {
   const [form, setForm] = useState({ full_name: '', phone: '', service: '', debt_amount: '', paid_amount: '', description: '' });
   const [msg, setMsg] = useState(null);
@@ -393,7 +429,7 @@ function AddDebtModal({ open, onClose, onSaved }) {
           </div>
           <div>
             <label className="label">Ko'rsatilgan xizmat *</label>
-            <input className="field" value={form.service} onChange={set('service')} placeholder="Moy almashtirish" required />
+            <ServiceSelect value={form.service} onChange={set('service')} required />
           </div>
           <div>
             <label className="label">Jami qarz summasi *</label>
@@ -407,6 +443,101 @@ function AddDebtModal({ open, onClose, onSaved }) {
         <div>
           <label className="label">Izoh</label>
           <textarea className="field min-h-[80px]" value={form.description} onChange={set('description')} placeholder="Castrol 5W-30 olindi, qolgan pul keyin beriladi." />
+        </div>
+        <div className="flex justify-end gap-3 pt-2">
+          <button type="button" onClick={onClose} className="rounded-xl border border-white/15 px-5 py-2.5 text-sm text-white/80 hover:bg-white/5">Bekor qilish</button>
+          <button type="submit" disabled={busy} className="btn-primary !py-2.5 text-sm disabled:opacity-60">
+            {busy ? <span className="text-sm">Saqlanmoqda...</span> : 'Saqlash'}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/**
+ * Edit an existing debt.
+ *
+ * Deliberately narrower than the create form: no paid amount. What has been paid
+ * only ever moves through the payment ledger, so editing it here would leave the
+ * payments list saying one thing and the debt saying another. Status and the
+ * remaining amount are derived by the server from the amounts for the same reason.
+ *
+ * Archiving a row is a separate action, so the edit button is not offered on
+ * archived rows at all -- the server answers 409 for them anyway.
+ */
+function EditDebtModal({ debt, onClose, onSaved }) {
+  const [form, setForm] = useState(null);
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  // Re-seeded from the row every time it opens, so a cancelled edit never leaks
+  // into the next one.
+  useEffect(() => {
+    if (!debt) { setForm(null); return; }
+    setForm({
+      full_name: debt.full_name || '',
+      phone: debt.phone || '',
+      service: debt.service || '',
+      debt_amount: String(debt.debt_amount == null ? '' : debt.debt_amount),
+      description: debt.description || '',
+    });
+    setMsg(null);
+    setBusy(false);
+  }, [debt]);
+
+  if (!debt || !form) return null;
+
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    if (busy) return; // double-submit guard: one click, one PATCH
+    setMsg(null);
+    setBusy(true);
+    try {
+      await api.patch(`/admin/debts/${debt.id}`, {
+        full_name: form.full_name,
+        phone: form.phone,
+        service: form.service,
+        debt_amount: form.debt_amount.replace(/\s/g, ''),
+        description: form.description,
+      });
+      await onSaved();
+    } catch (err) {
+      setMsg({ kind: 'error', text: err.message });
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title="Qarzni tahrirlash" wide>
+      <form onSubmit={onSubmit} className="space-y-4">
+        {msg && <Alert kind={msg.kind}>{msg.text}</Alert>}
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="label">Ism-familiya *</label>
+            <input className="field" value={form.full_name} onChange={set('full_name')} required />
+          </div>
+          <div>
+            <label className="label">Telefon *</label>
+            <input className="field" value={form.phone} onChange={set('phone')} placeholder="+998 90 123 45 67" required />
+          </div>
+          <div>
+            <label className="label">Ko'rsatilgan xizmat *</label>
+            <ServiceSelect value={form.service} onChange={set('service')} required disabled={busy} />
+          </div>
+          <div>
+            <label className="label">Jami qarz summasi *</label>
+            <input className="field" inputMode="numeric" value={form.debt_amount} onChange={set('debt_amount')} required disabled={busy} />
+          </div>
+        </div>
+        <div>
+          <label className="label">Izoh</label>
+          <textarea className="field min-h-[80px]" value={form.description} onChange={set('description')} disabled={busy} />
+        </div>
+        <div className="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-xs text-white/55">
+          To'langan summa {som(debt.paid_amount)} · qolgan qarz {som(debt.remaining_amount)}. To'lovni faqat "To'lov" orqali o'zgartirasiz.
         </div>
         <div className="flex justify-end gap-3 pt-2">
           <button type="button" onClick={onClose} className="rounded-xl border border-white/15 px-5 py-2.5 text-sm text-white/80 hover:bg-white/5">Bekor qilish</button>

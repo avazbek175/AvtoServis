@@ -36,6 +36,16 @@ import {
   updateDraft,
   validateDrafts,
 } from '../../client/src/pages/admin/inventoryDrafts.js';
+// The service catalogue is JSX-free for the same reason: which services exist, and
+// what an edit form does with a value that is no longer one of them, is data that
+// has to stay identical between the browser and the server.
+import {
+  LEGACY_SERVICE_NAME,
+  SERVICE_NAMES,
+  isServiceName,
+  serviceIcon,
+  serviceOptions,
+} from '../../client/src/serviceCatalog.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_ROOT = path.join(__dirname, '..');
@@ -468,14 +478,14 @@ async function runTests() {
   // ============================================================ A. worklog edit
   group('A. Worklog edit authorization (regression)');
   r = await m1.post('/api/admin/worklogs', {
-    title: 'Kapital taimirlash', service_type: 'Mator xodovoy', status: 'Jarayonda',
+    title: 'Kapital taimirlash', service_type: 'Mator', status: 'Jarayonda',
     price: 500000, customer_name: 'Ali', car_brand: 'Chevrolet', car_model: 'Cobalt',
   });
   check(r.status === 201, 'A1 master creates own worklog');
   const workId = r.data?.work?.id;
   check(r.data?.work?.is_public === 0, 'A2 new master worklog is private');
 
-  const baseBody = { title: 'x', service_type: 'Mator xodovoy', status: 'Jarayonda', price: 100 };
+  const baseBody = { title: 'x', service_type: 'Mator', status: 'Jarayonda', price: 100 };
 
   r = await m1.put(`/api/admin/worklogs/${workId}`, { ...baseBody, title: 'Kapital taimirlash v2' });
   check(r.status === 200 && r.data.work.title === 'Kapital taimirlash v2',
@@ -515,7 +525,7 @@ async function runTests() {
   r = await sa.get('/api/admin/worklogs');
   check(r.data.worklogs.length === 1, 'A15 super admin sees all worklogs');
 
-  r = await m1.put(`/api/admin/worklogs/${workId}`, { title: '', service_type: 'Mator xodovoy', status: 'Jarayonda' });
+  r = await m1.put(`/api/admin/worklogs/${workId}`, { title: '', service_type: 'Mator', status: 'Jarayonda' });
   check(r.status === 400, 'A16 validation still enforced on master edit');
   r = await m1.put(`/api/admin/worklogs/${workId}`, { ...baseBody, service_type: 'Nope' });
   check(r.status === 400, 'A17 invalid service_type rejected on master edit');
@@ -645,7 +655,7 @@ async function runTests() {
   // ============================================================ services + media (no regressions)
   group('Services / media / misc (regression guard)');
   r = await sa.get('/api/public/services');
-  check(r.data.services.length === 5, 'E1 seeded services served publicly');
+  check(r.data.services.length === 6, 'E1 seeded services served publicly');
 
   r = await sa.post('/api/admin/services', { name: 'Yangi xizmat', description: 'test' });
   check(r.status === 201, 'E2 create service');
@@ -1440,7 +1450,7 @@ async function advisoryLockTests() {
   check(!seeders.some((x) => x.out.includes('57014')),
     'P15.5b seeding never hits a statement timeout');
   const { rows: svc } = await db.query('SELECT count(*)::int c FROM services');
-  check(svc.length === 1 && Number(svc[0].c) === 5,
+  check(svc.length === 1 && Number(svc[0].c) === 6,
     'P15.5c services are seeded exactly once', JSON.stringify(svc));
   const { rows: set } = await db.query('SELECT count(*)::int c FROM settings');
   check(set.length === 1 && Number(set[0].c) > 0,
@@ -1598,7 +1608,7 @@ async function legacySettingsTests() {
   check(seeds.every((s) => s.code === 0), 'P12.15 five concurrent seeds all succeed',
     seeds.map((s) => `${s.code}${s.err ? ':' + s.err : ''}`).join(' | ').slice(0, 300));
   const seeded = await db.query('SELECT count(*)::int c FROM services');
-  check(seeded.rows[0].c === 5, 'P12.16 five concurrent seeds insert the catalogue exactly once', `services=${seeded.rows[0].c}`);
+  check(seeded.rows[0].c === 6, 'P12.16 five concurrent seeds insert the catalogue exactly once', `services=${seeded.rows[0].c}`);
 
   // Duplicate sort orders are legal (admins set them), so seeding must not
   // depend on a unique index over them.
@@ -1615,7 +1625,7 @@ async function legacySettingsTests() {
     c.on('exit', (code) => resolve({ code, err: err.trim() }));
   });
   const dupRows = await db.query('SELECT count(*)::int c FROM services');
-  check(dupSeed.code === 0 && dupRows.rows[0].c === 5,
+  check(dupSeed.code === 0 && dupRows.rows[0].c === 6,
     'P12.17 seeding tolerates pre-existing duplicate sort_order values', `${dupSeed.code} ${dupSeed.err}`);
 
   // An applied migration never re-runs, so a table dropped afterwards is not
@@ -1793,7 +1803,7 @@ async function readinessTests() {
   check(site.social === 'https://instagram.com/x' && site.telegram === 'https://t.me/avtoservis',
     'P14.3 legacy columns the current code never reads are still exposed', JSON.stringify(site).slice(0, 160));
   const svc = await get('/api/public/services', legacyBase);
-  check(svc.status === 200 && svc.data?.services?.length === 5,
+  check(svc.status === 200 && svc.data?.services?.length === 6,
     'P14.4 the default catalogue is seeded exactly once on the converted database',
     `status=${svc.status} services=${svc.data?.services?.length}`);
   const wl = await get('/api/public/worklogs', legacyBase);
@@ -2061,8 +2071,8 @@ async function readinessTests() {
   check(anonStats.status === 401, 'P16.15 the dashboard figures are not public', `status=${anonStats.status}`);
 
   group('P16.16 Editing a debt');
-  r = await dsa.patch(`/api/admin/debts/${dSev.id}`, { service: 'Diagnostika + skener' });
-  check(r.status === 200 && r.data.debt.service === 'Diagnostika + skener', 'P16.16 fields can be edited', `status=${r.status}`);
+  r = await dsa.patch(`/api/admin/debts/${dSev.id}`, { service: 'Programma' });
+  check(r.status === 200 && r.data.debt.service === 'Programma', 'P16.16 fields can be edited', `status=${r.status}`);
   check(Number(r.data.debt.remaining_amount) === 200000, 'P16.16 editing a non-amount field never disturbs the balance', `got=${r.data.debt && r.data.debt.remaining_amount}`);
   r = await dsa.patch(`/api/admin/debts/${dSev.id}`, { paid_amount: 0 });
   check(r.status === 200 && Number(r.data.debt.paid_amount) === 100000, 'P16.16 paid_amount is not editable directly, only through payments', `paid=${r.data.debt && r.data.debt.paid_amount}`);
@@ -2371,7 +2381,7 @@ async function readinessTests() {
   check(!readXlsx((await dsa.req('GET', '/api/admin/debts/export.xlsx?q=Legacy+Client')).buf).allText().includes('Chilanzar'),
     'P19.15 and it never reaches the export');
   // Editing must not blank out a value already on an old row either.
-  r = await dsa.patch(`/api/admin/debts/${dAli.id}`, { address: 'Yangi manzil', service: 'Moy algebrashtirish' });
+  r = await dsa.patch(`/api/admin/debts/${dAli.id}`, { address: 'Yangi manzil', service: 'Moy almashtirish' });
   check(r.status === 200 && !JSON.stringify(r.data).includes('address'), 'P19.15 an edit carrying the old field still succeeds and ignores it', `status=${r.status}`);
   check((await dsa.get(`/api/admin/debts/${dAli.id}`)).status === 200, 'P19.15 debts created before the change are still fully readable');
 
@@ -3348,6 +3358,415 @@ async function readinessTests() {
     'P18.17 a position past the last card is ignored rather than crashing the form');
   check(focusFromServerMessage('Something else went wrong', 5) === null,
     'P18.17 a message without a position still displays, just without the jump');
+
+  // =========================================================================
+  // P20. Debt editing, and splitting "Mator xodovoy" into two services
+  // =========================================================================
+  // Two fresh clients: the groups above sign in and out freely, and nothing here
+  // should depend on whoever happens to still hold a cookie.
+  const p20sa = newClient();
+  const p20m = newClient();
+  r = await p20sa.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+  check(r.status === 200, 'P20.0 the super admin signs in for the edit and split tests', `status=${r.status}`);
+  r = await p20m.post('/api/auth/login', { username: 'usta1', password: 'password123' });
+  check(r.status === 200, 'P20.0 and so does a master', `status=${r.status}`);
+
+  group('P20.1 An edit touches only the fields the form owns');
+  const e0 = await p20sa.post('/api/admin/debts', {
+    full_name: 'Edit Probe', phone: '+998901110000', service: 'Moy almashtirish',
+    debt_amount: 400000, paid_amount: 150000, description: 'birinchi',
+  });
+  check(e0.status === 201, 'P20.1 a debt to edit exists', `status=${e0.status}`);
+  const eId = e0.data.debt.id;
+  r = await p20sa.patch(`/api/admin/debts/${eId}`, {
+    full_name: 'Edit Probe (tahrir)', phone: '+998901110001', description: 'ikkinchi',
+  });
+  check(r.status === 200, 'P20.1 name, phone and description can be edited', `status=${r.status}`);
+  check(r.data.debt.full_name === 'Edit Probe (tahrir)' && r.data.debt.description === 'ikkinchi'
+    && r.data.debt.phone === '+998901110001',
+    'P20.1 and the new values come back', JSON.stringify(r.data.debt));
+  check(Number(r.data.debt.paid_amount) === 150000,
+    'P20.1 editing never moves what has been paid', `paid=${r.data.debt.paid_amount}`);
+  check(Number(r.data.debt.remaining_amount) === 250000,
+    'P20.1 the remaining amount stays derived, not submitted', `remaining=${r.data.debt.remaining_amount}`);
+  check(r.data.debt.status === 'partially_paid',
+    'P20.1 and so does the status', `status=${r.data.debt.status}`);
+
+  group('P20.2 Changing the debt amount re-derives everything downstream');
+  r = await p20sa.patch(`/api/admin/debts/${eId}`, { debt_amount: 150000 });
+  check(r.status === 200 && r.data.debt.status === 'paid',
+    'P20.2 lowering it to what is already paid marks the debt paid',
+    `status=${r.status} debt=${r.data.debt && r.data.debt.status}`);
+  r = await p20sa.patch(`/api/admin/debts/${eId}`, { debt_amount: 100000 });
+  check(r.status === 400,
+    'P20.2 it cannot be shrunk below what is already paid', `status=${r.status}`);
+  r = await p20sa.patch(`/api/admin/debts/${eId}`, { debt_amount: 600000 });
+  check(r.status === 200 && r.data.debt.status === 'partially_paid'
+    && Number(r.data.debt.remaining_amount) === 450000,
+    'P20.2 raising it re-derives the balance and the status together',
+    JSON.stringify(r.data.debt));
+
+  group('P20.3 An id that is not a debt is a 404');
+  r = await p20sa.patch('/api/admin/debts/99999999', { full_name: 'x' });
+  check(r.status === 404, 'P20.3 a non-existent id answers 404', `status=${r.status}`);
+  r = await p20sa.get('/api/admin/debts/99999999');
+  check(r.status === 404, 'P20.3 and reading it does too', `status=${r.status}`);
+
+  group('P20.4 The fields the edit form does not own are not writable');
+  r = await p20sa.patch(`/api/admin/debts/${eId}`, {
+    paid_amount: 0, status: 'unpaid', address: 'Yangi manzil', remaining_amount: 1,
+  });
+  check(r.status === 200, 'P20.4 a body carrying them is still accepted', `status=${r.status}`);
+  check(Number(r.data.debt.paid_amount) === 150000,
+    'P20.4 paid_amount is ignored -- it only moves through payments', `paid=${r.data.debt.paid_amount}`);
+  check(r.data.debt.status === 'partially_paid',
+    'P20.4 status stays derived from the amounts', `status=${r.data.debt.status}`);
+  check(Number(r.data.debt.remaining_amount) === 450000,
+    'P20.4 and the remaining amount is never client-writable',
+    `remaining=${r.data.debt.remaining_amount}`);
+  check(!JSON.stringify(r.data.debt).includes('address'),
+    'P20.4 and the retired address field never appears in an edit response',
+    JSON.stringify(r.data.debt));
+
+  group('P20.5 A changed service has to be one the shop offers');
+  const ft = await p20sa.post('/api/admin/debts', {
+    full_name: 'Free Text', phone: '+998901110002', service: 'Balans va rul', debt_amount: 10000,
+  });
+  const ftId = ft.data.debt.id;
+  r = await p20sa.patch(`/api/admin/debts/${ftId}`, { description: 'changed' });
+  check(r.status === 200,
+    'P20.5 a debt whose service is not in the catalogue stays editable while that field is left alone',
+    `status=${r.status} ${JSON.stringify(r.data && r.data.error)}`);
+  r = await p20sa.patch(`/api/admin/debts/${ftId}`, { service: 'Balans va rul' });
+  check(r.status === 200,
+    'P20.5 resubmitting its own unchanged value is accepted', `status=${r.status}`);
+  r = await p20sa.patch(`/api/admin/debts/${ftId}`, { service: 'Yoqilgi tizimi provasi' });
+  check(r.status === 400,
+    'P20.5 picking a service the shop does not offer is refused', `status=${r.status}`);
+  r = await p20sa.patch(`/api/admin/debts/${ftId}`, { service: 'Xodovoy' });
+  check(r.status === 200 && r.data.debt.service === 'Xodovoy',
+    'P20.5 and one it does offer goes through', `status=${r.status}`);
+
+  group('P20.6 An archived debt cannot be edited');
+  const arch = await p20sa.post('/api/admin/debts', {
+    full_name: 'Arch Edit', phone: '+998901110003', service: 'Mator', debt_amount: 5000,
+  });
+  const archId = arch.data.debt.id;
+  // Settle it first so the archived row is one the API could actually have
+  // produced: only a settled debt may be archived.
+  r = await p20sa.post(`/api/admin/debts/${archId}/mark-paid`);
+  check(r.status === 200, 'P20.6 the row is settled first', `status=${r.status}`);
+  // The archive endpoint is deliberately rate-limited to five attempts per fifteen
+  // minutes, and P16 already spends that budget -- including the wrong-key burst it
+  // exists to defend -- so by now it answers 429. What is under test is PATCH on an
+  // archived row, not the endpoint P16 already covers, so the flag is set directly.
+  const archDb = legacyClient(PG_DB);
+  await archDb.connect();
+  await archDb.query('UPDATE debts SET deleted_at = app_now() WHERE id = $1', [archId]);
+  await archDb.end();
+  r = await p20sa.get(`/api/admin/debts/${archId}`);
+  check(r.status === 200 && r.data.debt.deleted_at,
+    'P20.6 the row is archived', `status=${r.status} deleted_at=${r.data.debt && r.data.debt.deleted_at}`);
+  r = await p20sa.patch(`/api/admin/debts/${archId}`, { full_name: 'nope' });
+  check(r.status === 409, 'P20.6 and editing it is refused', `status=${r.status}`);
+
+  group('P20.7 Every edit is audited, and carries no secret');
+  const aud = legacyClient(PG_DB);
+  await aud.connect();
+  try {
+    const rows = await aud.query(
+      `SELECT action, admin_id, admin_name, metadata FROM debt_audit_logs
+        WHERE debt_id = $1 AND action = 'updated' ORDER BY id ASC LIMIT 1`, [eId]);
+    check(rows.rowCount === 1, 'P20.7 the first edit left an audit row');
+    const meta = String((rows.rows[0] || {}).metadata || '');
+    check(meta.includes('Edit Probe') && meta.includes('Edit Probe (tahrir)'),
+      'P20.7 recording the values before and after', meta.slice(0, 220));
+    check(!!rows.rows[0].admin_id,
+      'P20.7 together with the admin who made it', `admin=${rows.rows[0].admin_id}`);
+    const lower = meta.toLowerCase();
+    check(!lower.includes('pass') && !lower.includes('secret') && !lower.includes('token')
+      && !lower.includes('cookie'),
+      'P20.7 and never a password, pass key or session token', meta.slice(0, 220));
+  } catch (e) { check(false, 'P20.7 the audit row can be read', String(e && e.message)); }
+  await aud.end();
+
+  group('P20.8 The catalogue offers the two halves and not the whole');
+  r = await p20sa.get('/api/public/services');
+  const pubNames = (r.data.services || []).map((s) => s.name);
+  check(pubNames.includes('Mator'), 'P20.8 Mator is offered on its own', JSON.stringify(pubNames));
+  check(pubNames.includes('Xodovoy'), 'P20.8 and so is Xodovoy', JSON.stringify(pubNames));
+  check(!pubNames.includes(LEGACY_SERVICE_NAME),
+    'P20.8 the combined label is no longer selectable', JSON.stringify(pubNames));
+  check(pubNames.includes('Moy almashtirish') && pubNames.includes('Diagnostika')
+    && pubNames.includes('Elektrik') && pubNames.includes('Programma'),
+    'P20.8 and the rest of the catalogue survived the split', JSON.stringify(pubNames));
+
+  group('P20.9 Each half files as its own work log');
+  r = await p20m.post('/api/admin/worklogs', {
+    title: 'Mator ishi', service_type: 'Mator', status: 'Jarayonda', price: 100,
+  });
+  check(r.status === 201,
+    'P20.9 an engine job files as Mator', `status=${r.status} ${JSON.stringify(r.data && r.data.error)}`);
+  r = await p20m.post('/api/admin/worklogs', {
+    title: 'Xodovoy ishi', service_type: 'Xodovoy', status: 'Jarayonda', price: 100,
+  });
+  check(r.status === 201,
+    'P20.9 and a chassis job files as Xodovoy', `status=${r.status}`);
+  r = await p20m.post('/api/admin/worklogs', {
+    title: 'Birikma ish', service_type: LEGACY_SERVICE_NAME, status: 'Jarayonda', price: 100,
+  });
+  check(r.status === 400,
+    'P20.9 the retired combined label cannot be written again', `status=${r.status}`);
+  check(/ajratildi/.test((r.data && r.data.error) || ''),
+    'P20.9 and the message says where the two halves went', JSON.stringify(r.data));
+  r = await p20m.post('/api/admin/worklogs', {
+    title: 'Tanglayman', service_type: 'Bunday xizmat yo\'q', status: 'Jarayonda', price: 100,
+  });
+  check(r.status === 400, 'P20.9 an invented service is refused too', `status=${r.status}`);
+
+  group('P20.10 A work log filed under the old label still edits');
+  const wl20 = legacyClient(PG_DB);
+  await wl20.connect();
+  let legacyWlId = null;
+  try {
+    const usta = await wl20.query("SELECT id FROM users WHERE username = 'usta1' LIMIT 1");
+    const ins = await wl20.query(
+      `INSERT INTO work_logs (master_id, title, service_type, status, price, customer_name)
+       VALUES ($1, 'Eski ish', $2, 'Jarayonda', 250000, 'Mijoz') RETURNING id`,
+      [usta.rows[0].id, LEGACY_SERVICE_NAME]);
+    legacyWlId = ins.rows[0].id;
+  } catch (e) { check(false, 'P20.10 a legacy work log can be planted', String(e && e.message)); }
+  if (legacyWlId != null) {
+    r = await p20m.put(`/api/admin/worklogs/${legacyWlId}`, {
+      title: 'Eski ish (tahrir)', service_type: LEGACY_SERVICE_NAME,
+      status: 'Jarayonda', price: 300000,
+    });
+    check(r.status === 200 && r.data.work.title === 'Eski ish (tahrir)',
+      'P20.10 its own retired service type can be left exactly as it is',
+      `status=${r.status} ${JSON.stringify(r.data && r.data.error)}`);
+    check(r.data.work.service_type === LEGACY_SERVICE_NAME,
+      'P20.10 and the stored value is not silently rewritten',
+      `service=${r.data.work && r.data.work.service_type}`);
+    r = await p20m.put(`/api/admin/worklogs/${legacyWlId}`, {
+      title: 'Eski ish (tahrir)', service_type: 'Mator',
+      status: 'Jarayonda', price: 300000,
+    });
+    check(r.status === 200 && r.data.work.service_type === 'Mator',
+      'P20.10 when the operator does pick a half, it is accepted',
+      `status=${r.status} service=${r.data.work && r.data.work.service_type}`);
+    r = await p20m.put(`/api/admin/worklogs/${legacyWlId}`, {
+      title: 'Eski ish (tahrir)', service_type: 'Yoqilgi tizimi provasi',
+      status: 'Jarayonda', price: 300000,
+    });
+    check(r.status === 400, 'P20.10 but an invented service is still refused', `status=${r.status}`);
+  }
+  await wl20.end();
+
+  group('P20.11 A debt recorded under the old label keeps its whole history');
+  const h1 = await p20sa.post('/api/admin/debts', {
+    full_name: 'Split History', phone: '+998901110004',
+    service: LEGACY_SERVICE_NAME, debt_amount: 90000, paid_amount: 40000,
+  });
+  check(h1.status === 201, 'P20.11 the debt is accepted', `status=${h1.status}`);
+  const hId = h1.data.debt.id;
+  r = await p20sa.post(`/api/admin/debts/${hId}/payments`, { amount: 10000, note: 'eski yorliq' });
+  check(r.status === 201, 'P20.11 a payment against it still works', `status=${r.status}`);
+  const after = (await p20sa.get(`/api/admin/debts/${hId}`)).data;
+  check(after.debt.service === LEGACY_SERVICE_NAME,
+    'P20.11 the label it was recorded under did not move',
+    `service=${after.debt.service}`);
+  check(Number(after.debt.paid_amount) === 50000 && Number(after.debt.remaining_amount) === 40000,
+    'P20.11 and neither did the money', JSON.stringify(after.debt));
+  check(after.audit_logs.length >= 2,
+    'P20.11 its audit trail grew, it was not rewritten', `rows=${after.audit_logs.length}`);
+
+  group('P20.12 The split migration is safe to run again');
+  const migSql = fs.readFileSync(path.join(SERVER_ROOT, 'migrations', '006_split_mator_xodovoy.sql'), 'utf8');
+  const migBody = migSql.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n');
+  check(!/\b(DROP|TRUNCATE)\b/i.test(migBody) && !/DELETE\s+FROM/i.test(migBody),
+    'P20.12 it contains no DROP, TRUNCATE or DELETE FROM', 'one of them was found');
+  check(/NOT EXISTS/.test(migBody) && /is_active = 0/.test(migBody),
+    'P20.12 it retires the old row instead of removing it', 'guards missing');
+  const migReplay = legacyClient(PG_DB);
+  await migReplay.connect();
+  try {
+    await migReplay.query('DROP SCHEMA IF EXISTS p20_split CASCADE');
+    await migReplay.query('CREATE SCHEMA p20_split');
+    await migReplay.query('SET search_path TO p20_split');
+    await migReplay.query(`CREATE TABLE services (
+      id SERIAL PRIMARY KEY, name TEXT NOT NULL,
+      description TEXT DEFAULT '', benefits TEXT DEFAULT '', image TEXT DEFAULT '',
+      icon TEXT DEFAULT '', price TEXT DEFAULT '',
+      sort_order INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1)`);
+    await migReplay.query(`INSERT INTO services (name, sort_order, is_active) VALUES
+      ('Moy almashtirish', 3, 1), ('Mator xodovoy', 5, 1), ('Diagnostika', 9, 1)`);
+    await migReplay.query(migSql);
+    const first = (await migReplay.query('SELECT name, sort_order, is_active FROM services ORDER BY sort_order, id')).rows;
+    const byName = Object.fromEntries(first.map((s) => [s.name, s]));
+    check(first.length === 5, 'P20.12 exactly two services were added', `rows=${first.length}`);
+    check(byName[LEGACY_SERVICE_NAME] && Number(byName[LEGACY_SERVICE_NAME].is_active) === 0,
+      'P20.12 the combined row was deactivated, not deleted',
+      JSON.stringify(byName[LEGACY_SERVICE_NAME]));
+    check(byName.Mator && Number(byName.Mator.sort_order) === 10,
+      'P20.12 Mator was appended after the highest existing sort order',
+      `sort=${byName.Mator && byName.Mator.sort_order}`);
+    check(byName.Xodovoy && Number(byName.Xodovoy.sort_order) === 11,
+      'P20.12 Xodovoy sits right after it', `sort=${byName.Xodovoy && byName.Xodovoy.sort_order}`);
+    check(Number(byName['Moy almashtirish'].sort_order) === 3
+      && Number(byName.Diagnostika.sort_order) === 9,
+      'P20.12 and no existing sort order moved', JSON.stringify(first));
+    await migReplay.query(migSql);
+    const second = (await migReplay.query('SELECT name, sort_order, is_active FROM services ORDER BY sort_order, id')).rows;
+    check(JSON.stringify(second) === JSON.stringify(first),
+      'P20.12 running it a second time changes nothing at all', JSON.stringify(second));
+  } catch (e) { check(false, 'P20.12 the migration can be replayed in isolation', String(e && e.message)); }
+  await migReplay.query('SET search_path TO public').catch(() => {});
+  await migReplay.query('DROP SCHEMA IF EXISTS p20_split CASCADE').catch(() => {});
+  await migReplay.end();
+
+  group('P20.13 The retired name survives only where history needs it');
+  const srcRoot = path.join(SERVER_ROOT, '..', 'client', 'src');
+  const clientHits = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!/\.(js|jsx)$/.test(entry.name)) continue;
+      fs.readFileSync(full, 'utf8').split('\n').forEach((line, i) => {
+        if (line.includes(LEGACY_SERVICE_NAME)) clientHits.push(`${entry.name}:${i + 1}`);
+      });
+    }
+  };
+  walk(srcRoot);
+  check(clientHits.length > 0,
+    'P20.13 the legacy constant still exists, so an old record can render', JSON.stringify(clientHits));
+  check(clientHits.every((h) => h.startsWith('serviceCatalog.js')),
+    'P20.13 and it lives in exactly one place, never in a screen',
+    clientHits.filter((h) => !h.startsWith('serviceCatalog.js')).join(', '));
+  const seedSrc = fs.readFileSync(path.join(SERVER_ROOT, 'src', 'db', 'index.js'), 'utf8');
+  check(!seedSrc.includes(`'${LEGACY_SERVICE_NAME}'`),
+    'P20.13 the seed no longer writes the combined name into a new database');
+
+  group('P20.14 The database catalogue is exactly the six services');
+  const cat = legacyClient(PG_DB);
+  await cat.connect();
+  let activeNames = [];
+  try {
+    const rows = await cat.query('SELECT name, is_active FROM services ORDER BY sort_order ASC, id ASC');
+    activeNames = rows.rows.filter((s) => Number(s.is_active) === 1).map((s) => s.name);
+    check(JSON.stringify(activeNames) === JSON.stringify(SERVICE_NAMES),
+      'P20.14 the active services are the six, in catalogue order', JSON.stringify(activeNames));
+    check(!rows.rows.some((s) => s.name === LEGACY_SERVICE_NAME && Number(s.is_active) === 1),
+      'P20.14 and the combined row is never active',
+      JSON.stringify(rows.rows.filter((s) => s.name === LEGACY_SERVICE_NAME)));
+  } catch (e) { check(false, 'P20.14 the catalogue can be read', String(e && e.message)); }
+  await cat.end();
+
+  group('P20.15 The client catalogue is the same six names');
+  check(SERVICE_NAMES.length === 6, 'P20.15 there are six of them', JSON.stringify(SERVICE_NAMES));
+  check(SERVICE_NAMES[0] === 'Mator' && SERVICE_NAMES[1] === 'Xodovoy',
+    'P20.15 and the two halves come first, in the order the shop offers them',
+    JSON.stringify(SERVICE_NAMES));
+  check(SERVICE_NAMES.every((n) => isServiceName(n)),
+    'P20.15 every one of them is accepted as a service name');
+  check(!isServiceName(LEGACY_SERVICE_NAME),
+    'P20.15 and the retired combined name is not');
+  check(!isServiceName('') && !isServiceName(null) && !isServiceName('Balans va rul'),
+    'P20.15 neither is an empty or invented one', JSON.stringify(isServiceName('Balans va rul')));
+
+  group('P20.16 An edit form never loses a value it did not touch');
+  const fresh = serviceOptions('');
+  check(fresh.length === 6 && fresh.every((o) => !o.legacy),
+    'P20.16 a new debt is offered exactly the six services', JSON.stringify(fresh.map((o) => o.value)));
+  check(serviceOptions('Moy almashtirish').length === 6,
+    'P20.16 a value already on the catalogue gets no duplicate entry',
+    JSON.stringify(serviceOptions('Moy almashtirish').map((o) => o.value)));
+  const legacyOpts = serviceOptions(LEGACY_SERVICE_NAME);
+  check(legacyOpts.length === 7 && legacyOpts[0].value === LEGACY_SERVICE_NAME,
+    'P20.16 a debt holding the old label is offered it back first',
+    JSON.stringify(legacyOpts[0]));
+  check(legacyOpts[0].legacy === true && legacyOpts[0].label.includes('(eski)'),
+    'P20.16 clearly marked as old rather than silently dropped',
+    JSON.stringify(legacyOpts[0]));
+  check(serviceOptions('Balans va rul')[0].value === 'Balans va rul',
+    'P20.16 the same holds for any value the catalogue does not know',
+    JSON.stringify(serviceOptions('Balans va rul')[0]));
+  check(serviceIcon('Mator') === 'engine' && serviceIcon('Xodovoy') === 'wrench',
+    'P20.16 both halves resolve to their own icon');
+  check(serviceIcon(LEGACY_SERVICE_NAME) === 'engine',
+    'P20.16 and a work log filed before the split still gets an icon');
+  check(serviceIcon('nothing like it') === 'wrench',
+    'P20.16 an unknown service falls back to the wrench instead of blanking');
+
+  group('P20.17 No half-invisible service is left behind');
+  r = await p20sa.get('/api/admin/services');
+  const adminSvc = r.data.services || [];
+  check(adminSvc.length === 6,
+    'P20.17 the admin list holds exactly six rows', `count=${adminSvc.length}`);
+  check(adminSvc.every((s) => Number(s.is_active) === 1),
+    'P20.17 every one of them is active', JSON.stringify(adminSvc.map((s) => [s.name, s.is_active])));
+  check(!adminSvc.some((s) => s.name === LEGACY_SERVICE_NAME),
+    'P20.17 and there is no deactivated duplicate of the old label',
+    JSON.stringify(adminSvc.map((s) => s.name)));
+
+  group('P20.18 The catalogue is declared in one place');
+  const declaredOnce = [
+    ['pages/admin/WorkLogs.jsx', 'SERVICE_NAMES'],
+    ['pages/admin/AdminLogin.jsx', 'SERVICE_NAMES'],
+    ['components/Footer.jsx', 'SERVICE_NAMES'],
+    ['pages/admin/DebtLedger.jsx', 'serviceOptions'],
+  ];
+  for (const [file, needle] of declaredOnce) {
+    const src = fs.readFileSync(path.join(srcRoot, file), 'utf8');
+    check(src.includes(needle),
+      `P20.18 ${file} reads the catalogue from serviceCatalog.js`);
+    check(!/const\s+(SERVICE_TYPES|SPECIALTIES)\s*=\s*\[/.test(src),
+      `P20.18 ${file} no longer carries its own hard-coded list`);
+  }
+  const worklogsSrc = fs.readFileSync(path.join(SERVER_ROOT, 'src', 'routes', 'worklogs.js'), 'utf8');
+  check(!worklogsSrc.includes(`'${LEGACY_SERVICE_NAME}'`) || /LEGACY_SERVICE_TYPE\s*=/.test(worklogsSrc),
+    'P20.18 the server keeps the retired name only as a labelled legacy constant');
+
+  group('P20.19 Replaying the split rewrites no history');
+  const liveDb = legacyClient(PG_DB);
+  await liveDb.connect();
+  try {
+    const plantedWl = await liveDb.query(
+      `INSERT INTO work_logs (master_id, title, service_type, status, price, customer_name)
+       SELECT id, 'Replay ishi', $1, 'Jarayonda', 1000, 'Mijoz' FROM users
+        WHERE username = 'usta1' LIMIT 1 RETURNING id`, [LEGACY_SERVICE_NAME]);
+    const replayDebt = await p20sa.post('/api/admin/debts', {
+      full_name: 'Replay Row', phone: '+998901110005',
+      service: LEGACY_SERVICE_NAME, debt_amount: 70000, paid_amount: 20000,
+    });
+    const before = await liveDb.query(
+      'SELECT name, sort_order, is_active FROM services WHERE is_active = 1 ORDER BY sort_order, id');
+    await liveDb.query(migSql);
+    const after = await liveDb.query(
+      'SELECT name, sort_order, is_active FROM services WHERE is_active = 1 ORDER BY sort_order, id');
+    check(JSON.stringify(after.rows) === JSON.stringify(before.rows),
+      'P20.19 the live catalogue is byte-for-byte the same afterwards',
+      JSON.stringify(after.rows));
+    const keptWl = await liveDb.query('SELECT service_type FROM work_logs WHERE id = $1',
+      [plantedWl.rows[0].id]);
+    check(keptWl.rows[0].service_type === LEGACY_SERVICE_NAME,
+      'P20.19 the work log filed under the old label kept its value',
+      `service=${keptWl.rows[0].service_type}`);
+    const keptDebt = await liveDb.query(
+      'SELECT service, debt_amount, paid_amount FROM debts WHERE id = $1', [replayDebt.data.debt.id]);
+    check(keptDebt.rows[0].service === LEGACY_SERVICE_NAME
+      && Number(keptDebt.rows[0].debt_amount) === 70000
+      && Number(keptDebt.rows[0].paid_amount) === 20000,
+      'P20.19 and so did the debt recorded under it', JSON.stringify(keptDebt.rows[0]));
+    const pays = await liveDb.query(
+      'SELECT COUNT(*)::int AS n FROM debt_payments WHERE debt_id = $1', [replayDebt.data.debt.id]);
+    check(pays.rows[0].n === 1, 'P20.19 its payment history survived untouched',
+      `n=${pays.rows[0].n}`);
+    const audits = await liveDb.query(
+      'SELECT COUNT(*)::int AS n FROM debt_audit_logs WHERE debt_id = $1', [replayDebt.data.debt.id]);
+    check(audits.rows[0].n >= 1, 'P20.19 and so did its audit trail', `n=${audits.rows[0].n}`);
+  } catch (e) { check(false, 'P20.19 the split can be replayed on the live catalogue', String(e && e.message)); }
+  await liveDb.end();
 }
 
 try {
