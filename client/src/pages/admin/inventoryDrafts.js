@@ -26,11 +26,16 @@ let uidSeq = 0;
  * `unit` is absent on purpose: it follows from `type` (oil is litres, a filter is
  * pieces), so it is derived when the payload is built rather than stored -- which is
  * also how the server refuses a contradicting value.
+ *
+ * The card deliberately has no `minimum_quantity`, `cost_price` or
+ * `initial_quantity`: the operator does not collect them any more. A product is
+ * created empty and stocked through "Omborga qo'shish", and the server keeps
+ * applying its own defaults (minimum 0, price 0, opening stock 0) when they are
+ * absent. The columns themselves stay in the database untouched.
  */
 export function emptyDraft() {
   return {
-    name: '', type: 'oil', brand: '', viscosity: '',
-    package_size: '', minimum_quantity: '', cost_price: '', initial_quantity: '',
+    name: '', type: 'oil', brand: '', viscosity: '', package_size: '',
   };
 }
 
@@ -125,12 +130,12 @@ export function clearFieldError(errors, index, keys) {
   return next;
 }
 
-// Same shapes the server's strict parsers accept: up to 3 decimals for a quantity
-// (NUMERIC(12,3)), 2 for money (NUMERIC(12,2)). Matching them here means the form
-// can say what is wrong instead of waiting for a round trip to be told.
+// Same shape the server's strict parser accepts for a quantity: up to 3 decimals
+// (NUMERIC(12,3)). Matching it here means the form can say what is wrong instead of
+// waiting for a round trip to be told. The money and integer parsers went away with
+// the fields that used them -- `cost_price` and `initial_quantity` are no longer part
+// of this form, so there is nothing left to check.
 const QTY_RE = /^\d+(\.\d{1,3})?$/;
-const MONEY_RE = /^\d+(\.\d{1,2})?$/;
-const INT_RE = /^\d+$/;
 
 /**
  * Validates one card and returns `{ field: message }`.
@@ -139,9 +144,9 @@ const INT_RE = /^\d+$/;
  * holding eight identically shaped cards cannot be read from the field label alone
  * -- the operator has to know which card to go and fix.
  *
- * An empty optional numeric field is accepted and left out of the payload, so the
- * server's own defaults apply (package 1, minimum 0, price 0, no opening stock).
- * That keeps the batch form consistent with the single-product form.
+ * An empty optional field is accepted and left out of the payload, so the server's
+ * own default applies (package 1). `minimum_quantity`, `cost_price` and
+ * `initial_quantity` are not validated here at all: the form never collects them.
  */
 export function validateDraft(draft, index) {
   const errors = {};
@@ -154,16 +159,11 @@ export function validateDraft(draft, index) {
     errors.viscosity = `${at}: Viskozitet kiritilishi shart.`;
   }
 
-  const check = (field, raw, { integer = false, money = false, mustBePositive = false } = {}) => {
+  const check = (field, raw, { mustBePositive = false } = {}) => {
     const value = String(raw == null ? '' : raw).trim();
     if (!value) return;
-    const re = money ? MONEY_RE : integer ? INT_RE : QTY_RE;
-    if (!re.test(value)) {
-      errors[field] = money
-        ? `${at}: Narx noto'g'ri formatda (masalan 45000 yoki 45000.50).`
-        : integer
-          ? `${at}: Butun son kiriting (kasr qismi bo'lmaydi).`
-          : `${at}: Noto'g'ri formatda (masalan 4 yoki 4.5).`;
+    if (!QTY_RE.test(value)) {
+      errors[field] = `${at}: Noto'g'ri formatda (masalan 4 yoki 4.5).`;
       return;
     }
     if (mustBePositive && Number(value) <= 0) {
@@ -172,11 +172,6 @@ export function validateDraft(draft, index) {
   };
 
   check('package_size', draft.package_size, { mustBePositive: true });
-  check('minimum_quantity', draft.minimum_quantity);
-  check('cost_price', draft.cost_price, { money: true });
-  // A filter is counted in whole pieces. Half a filter cannot be consumed later
-  // either, so seeding one here would create stock nobody can ever use.
-  check('initial_quantity', draft.initial_quantity, { integer: !isOil });
 
   return errors;
 }
@@ -208,8 +203,11 @@ export function focusFromServerMessage(message, cardCount) {
 /**
  * Builds one payload entry.
  *
- * Only the fields the operator actually filled are sent, so the server's defaults
- * apply to the rest instead of being overwritten with empty strings.
+ * Only the fields the form actually shows are sent, so the server's own defaults
+ * apply to the rest. That is what keeps a newly created product at
+ * `current_quantity = 0` with `minimum_quantity = 0` and `cost_price = 0`: the
+ * request never mentions them, and the operator stocks the product afterwards
+ * through "Omborga qo'shish".
  */
 export function draftPayload(draft) {
   const isOil = draft.type === 'oil';
@@ -221,8 +219,6 @@ export function draftPayload(draft) {
     unit: isOil ? 'liter' : 'piece',
   };
   if (isOil) payload.viscosity = text(draft.viscosity);
-  for (const field of ['package_size', 'minimum_quantity', 'cost_price', 'initial_quantity']) {
-    if (text(draft[field])) payload[field] = text(draft[field]);
-  }
+  if (text(draft.package_size)) payload.package_size = text(draft.package_size);
   return payload;
 }

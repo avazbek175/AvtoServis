@@ -3304,18 +3304,17 @@ async function readinessTests() {
   check(firstInvalidIndex(errs) === 0, 'P18.15 the first bad card is the one to jump to', `${firstInvalidIndex(errs)}`);
   check(firstInvalidIndex([{}, {}, {}]) === -1, 'P18.15 a clean batch has nothing to jump to');
 
-  // The field rules.
+  // The field rules. Only what the card can actually hold is checked any more:
+  // minimal quantity, cost price and opening stock left the form, so the client
+  // validator has no opinion about them -- a stale card carrying them is simply
+  // ignored rather than refused.
   const qtyCases = [
-    [{ initial_quantity: '4.5' }, 'oil', false, 'a fractional oil opening stock is allowed'],
-    [{ initial_quantity: '2.75' }, 'oil', false, 'and so is a quarter-litre one'],
-    [{ initial_quantity: '1.5' }, 'filter', true, 'a fractional filter opening stock is refused'],
-    [{ initial_quantity: '10' }, 'filter', false, 'a whole filter opening stock is fine'],
-    [{ initial_quantity: '-1' }, 'oil', true, 'a negative opening stock is refused'],
     [{ package_size: '0' }, 'oil', true, 'a zero package size is refused'],
     [{ package_size: '4.5.6' }, 'oil', true, 'a malformed package size is refused'],
-    [{ cost_price: '-5' }, 'oil', true, 'a negative price is refused'],
-    [{ cost_price: '45000abc' }, 'oil', true, 'a partially numeric price is refused'],
-    [{ cost_price: '45000.50' }, 'oil', false, 'a price with cents is fine'],
+    [{ package_size: '4' }, 'oil', false, 'a package size is still collected and checked'],
+    [{ initial_quantity: '1.5' }, 'filter', false, 'an opening stock is no longer collected, so nothing to refuse'],
+    [{ cost_price: '-5' }, 'oil', false, 'a price is no longer collected, so nothing to refuse'],
+    [{ minimum_quantity: 'abc' }, 'oil', false, 'a minimum is no longer collected, so nothing to refuse'],
   ];
   for (const [fields, type, expectError, label] of qtyCases) {
     const draft = { ...emptyDraft(), name: 'Sinov', brand: 'Sinov', type, ...(type === 'oil' ? { viscosity: '5W-30' } : {}), ...fields };
@@ -3341,15 +3340,22 @@ async function readinessTests() {
     'P18.15 clearing on a card with no errors yet is harmless');
 
   group('P18.16 The payload the form builds');
+  // A blank card carries only what the form can ask for. The three retired fields
+  // are not even present as empty keys, so they can never reach the request.
+  check(JSON.stringify(Object.keys(emptyDraft()).sort()) === JSON.stringify(['brand', 'name', 'package_size', 'type', 'viscosity']),
+    'P18.16 a blank card holds only the fields the form shows', JSON.stringify(Object.keys(emptyDraft()).sort()));
   const oilPayload = draftPayload({ name: '  Castrol EDGE  ', type: 'oil', brand: ' Castrol ', viscosity: ' 5W-30 ', package_size: '4', minimum_quantity: '20', cost_price: '45000', initial_quantity: '100' });
-  check(JSON.stringify(oilPayload) === JSON.stringify({ name: 'Castrol EDGE', type: 'oil', brand: 'Castrol', unit: 'liter', viscosity: '5W-30', package_size: '4', minimum_quantity: '20', cost_price: '45000', initial_quantity: '100' }),
+  check(JSON.stringify(oilPayload) === JSON.stringify({ name: 'Castrol EDGE', type: 'oil', brand: 'Castrol', unit: 'liter', viscosity: '5W-30', package_size: '4' }),
     'P18.16 a filled oil card produces the spec\'s payload, trimmed', JSON.stringify(oilPayload));
+  check(!('minimum_quantity' in oilPayload) && !('cost_price' in oilPayload) && !('initial_quantity' in oilPayload),
+    'P18.16 the three retired fields are never sent, whatever the card carries', JSON.stringify(oilPayload));
   const filterPayload = draftPayload({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', viscosity: '', package_size: '', minimum_quantity: '5', cost_price: '35000', initial_quantity: '20' });
   check(filterPayload.unit === 'piece' && filterPayload.viscosity === undefined,
     'P18.16 a filter never sends a viscosity', JSON.stringify(filterPayload));
   check(filterPayload.package_size === undefined,
     'P18.16 an untouched optional field is left out, so the server default applies', JSON.stringify(filterPayload));
-  check(filterPayload.initial_quantity === '20', 'P18.16 the opening stock uses the name the endpoint documents', JSON.stringify(filterPayload));
+  check(JSON.stringify(filterPayload) === JSON.stringify({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', unit: 'piece' }),
+    'P18.16 a plain filter card sends exactly the fields the form shows', JSON.stringify(filterPayload));
 
   group('P18.17 A server error points back at its card');
   check(focusFromServerMessage('3-mahsulot: Viskozitet majburiy', 5) === 2,
@@ -3358,6 +3364,82 @@ async function readinessTests() {
     'P18.17 a position past the last card is ignored rather than crashing the form');
   check(focusFromServerMessage('Something else went wrong', 5) === null,
     'P18.17 a message without a position still displays, just without the jump');
+
+  // =========================================================================
+  // P18.18-20. Creating a product no longer means stocking it
+  // =========================================================================
+  // The add and edit forms send six fields. Minimal quantity, cost price and
+  // opening stock are still columns -- and still sent by anything that wants to --
+  // but nothing in the app asks for them any more, so the defaults are what the
+  // operator actually gets and "Omborga qo'shish" is how stock arrives.
+  group('P18.18 A new product starts empty, with the server defaults');
+  r = await isa.post('/api/admin/inventory/products', {
+    name: 'Boshlang\'ichsiz Oil', type: 'oil', brand: 'Gulf', viscosity: '5W-30', package_size: 4, unit: 'liter',
+  });
+  const startsEmpty = r.data && r.data.product;
+  check(r.status === 201, 'P18.18 a product sent with none of the three fields is accepted',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!startsEmpty && Number(startsEmpty.current_quantity) === 0,
+    'P18.18 its current_quantity is 0', JSON.stringify(startsEmpty && startsEmpty.current_quantity));
+  check(!!startsEmpty && Number(startsEmpty.minimum_quantity) === 0,
+    'P18.18 its minimum_quantity falls back to the server default 0', JSON.stringify(startsEmpty && startsEmpty.minimum_quantity));
+  check(!!startsEmpty && Number(startsEmpty.cost_price) === 0,
+    'P18.18 its cost_price falls back to the server default 0', JSON.stringify(startsEmpty && startsEmpty.cost_price));
+  const noOpening = startsEmpty ? await openingMovements(startsEmpty.id) : [];
+  check(!!startsEmpty && noOpening.length === 0,
+    'P18.18 and it has no opening movement, because nothing was stocked', `n=${noOpening.length}`);
+
+  group('P18.19 Stock arrives afterwards, through "Omborga qo\'shish"');
+  r = await isa.post(`/api/admin/inventory/products/${startsEmpty && startsEmpty.id}/stock-in`, { quantity: 100, note: 'Birinchi kirim' });
+  check(r.status === 201 && !!(r.data && r.data.product) && Number(r.data.product.current_quantity) === 100,
+    'P18.19 a stock-in takes the product from 0 to 100', `status=${r.status} ${JSON.stringify(r.data && r.data.product)}`);
+  const afterStockIn = startsEmpty ? await openingMovements(startsEmpty.id) : [];
+  check(afterStockIn.length === 1 && afterStockIn[0].movement_type === 'purchase'
+    && afterStockIn[0].before_quantity === 0 && afterStockIn[0].after_quantity === 100,
+    'P18.19 it is one purchase row reading 0 -> 100', JSON.stringify(afterStockIn));
+  r = await isa.get(`/api/admin/inventory/products/${startsEmpty.id}`);
+  check(r.status === 200 && !!(r.data && r.data.totals) && r.data.totals.consistent === true,
+    'P18.19 the ledger and the level still agree after the stock-in',
+    JSON.stringify(r.data && r.data.totals));
+
+  group('P18.20 A batch carries only the fields the form shows');
+  r = await isa.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Sodda Moy', type: 'oil', brand: 'Gulf', viscosity: '5W-30', package_size: 4, unit: 'liter' },
+      { name: 'Sodda Filtr', type: 'filter', brand: 'MANN', unit: 'piece' },
+    ],
+  });
+  const simpleBatch = r.data && r.data.products;
+  check(r.status === 201 && r.data.count === 2,
+    'P18.20 a mixed oil/filter batch with no minimum, price or opening stock is accepted',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!simpleBatch && simpleBatch.length === 2 && simpleBatch.every((p) => Number(p.current_quantity) === 0
+    && Number(p.minimum_quantity) === 0 && Number(p.cost_price) === 0),
+    'P18.20 every product in it comes out at 0 / 0 / 0', JSON.stringify(simpleBatch));
+  check(!!simpleBatch && simpleBatch.length === 2 && simpleBatch[0].unit === 'liter'
+    && simpleBatch[1].unit === 'piece' && Number(simpleBatch[1].package_size) === 1,
+    'P18.20 and the untouched defaults are applied per card', JSON.stringify(simpleBatch));
+  const batchEmptyMoves = simpleBatch ? await openingMovements(simpleBatch[0].id) : [];
+  check(batchEmptyMoves.length === 0, 'P18.20 the batch wrote no opening movement either', `n=${batchEmptyMoves.length}`);
+
+  group('P18.21 An edit that omits the retired fields leaves them alone');
+  r = await isa.post('/api/admin/inventory/products', {
+    name: 'Tahrirda Qoladigan', type: 'oil', brand: 'X', viscosity: '5W-30',
+    minimum_quantity: 7, cost_price: 123450,
+  });
+  const keep = r.data && r.data.product;
+  check(r.status === 201 && !!keep && Number(keep.minimum_quantity) === 7 && Number(keep.cost_price) === 123450,
+    'P18.21 a product can still be created with explicit values', `status=${r.status} ${JSON.stringify(keep)}`);
+  r = await isa.patch(`/api/admin/inventory/products/${keep && keep.id}`, {
+    name: 'Tahrirda Qoladigan (yangilangan)', brand: 'Y', package_size: 4,
+  });
+  const editedRow = r.data && r.data.product;
+  check(r.status === 200, 'P18.21 an edit carrying only the six form fields is accepted', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!editedRow && Number(editedRow.minimum_quantity) === 7 && Number(editedRow.cost_price) === 123450
+    && Number(editedRow.current_quantity) === 0,
+    'P18.21 the values it did not send are exactly what they were', JSON.stringify(editedRow));
+  check(!!editedRow && editedRow.name.includes('yangilangan') && editedRow.brand === 'Y' && Number(editedRow.package_size) === 4,
+    'P18.21 and the fields it did send were applied', JSON.stringify(editedRow));
 
   // =========================================================================
   // P20. Debt editing, and splitting "Mator xodovoy" into two services

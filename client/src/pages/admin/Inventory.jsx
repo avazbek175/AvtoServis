@@ -93,12 +93,16 @@ function productLabel(p) {
 }
 
 const EMPTY_FORM = {
-  name: '', type: 'oil', brand: '', viscosity: '', unit: 'liter',
-  package_size: '', minimum_quantity: '', cost_price: '', current_quantity: '',
+  name: '', type: 'oil', brand: '', viscosity: '', unit: 'liter', package_size: '',
 };
 
 /**
- * The single-product form (`EMPTY_FORM`) is kept exactly as it was.
+ * The edit form is deliberately the same six fields the batch form shows: type,
+ * name, brand, viscosity, unit and package size. `minimum_quantity` and
+ * `cost_price` still exist in the database and on the API -- the form simply does
+ * not collect them any more, so a PATCH that omits them leaves the stored values
+ * exactly as they were. Stock is never edited here either; it only moves through
+ * "Omborga qo'shish", "Sarf" and "Tuzatish".
  *
  * The batch form lives in `inventoryDrafts.js` alongside its card, because the rules
  * worth testing -- what happens when a card in the middle is removed, what happens
@@ -835,9 +839,12 @@ function MovementRow({ m, compact }) {
  * has its own form below; mixing the two would mean a card array and an activation
  * toggle sharing one piece of state.
  *
- * Note there is no quantity field here: stock is never edited directly, only moved
- * through the stock endpoints, so a control that the server would reject is not
- * offered.
+ * Two fields that used to live here are gone from the UI but not from the table:
+ * "Minimal qoldiq" and "Kelish narxi". They are left out of the payload, so the
+ * server keeps the stored values and the low-stock / value reports keep working
+ * exactly as before. There is no quantity field either -- stock is never edited
+ * directly, only moved through the stock endpoints, so a control that the server
+ * would reject is not offered.
  */
 function EditProductModal({ open, product, onClose, onSaved }) {
   const [form, setForm] = useState(EMPTY_FORM);
@@ -856,9 +863,6 @@ function EditProductModal({ open, product, onClose, onSaved }) {
             viscosity: product.viscosity || '',
             unit: product.unit,
             package_size: String(product.package_size ?? ''),
-            minimum_quantity: String(product.minimum_quantity ?? ''),
-            cost_price: String(product.cost_price ?? ''),
-            current_quantity: String(product.current_quantity ?? ''),
           }
         : EMPTY_FORM
     );
@@ -880,8 +884,6 @@ function EditProductModal({ open, product, onClose, onSaved }) {
         brand: form.brand,
         unit: isOil ? 'liter' : 'piece',
         package_size: form.package_size,
-        minimum_quantity: form.minimum_quantity,
-        cost_price: form.cost_price,
       };
       if (isOil) payload.viscosity = form.viscosity;
       await api.patch(`/admin/inventory/products/${product.id}`, payload);
@@ -898,7 +900,7 @@ function EditProductModal({ open, product, onClose, onSaved }) {
       <form onSubmit={onSubmit} className="space-y-4">
         {msg && <Alert kind={msg.kind}>{msg.text}</Alert>}
 
-        <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-2">
           <div>
             <label className="label">Mahsulot turi *</label>
             <select className="field" value={form.type} disabled onChange={() => {}}>
@@ -928,14 +930,6 @@ function EditProductModal({ open, product, onClose, onSaved }) {
           <div>
             <label className="label">Qadoq hajmi ({isOil ? 'L' : 'dona'})</label>
             <input className="field" inputMode="decimal" value={form.package_size} onChange={set('package_size')} placeholder={isOil ? '4' : '1'} />
-          </div>
-          <div>
-            <label className="label">Minimal qoldiq</label>
-            <input className="field" inputMode="decimal" value={form.minimum_quantity} onChange={set('minimum_quantity')} placeholder={isOil ? '20' : '5'} />
-          </div>
-          <div>
-            <label className="label">Kelish narxi (so'm)</label>
-            <input className="field" inputMode="decimal" value={form.cost_price} onChange={set('cost_price')} placeholder="45000" />
           </div>
         </div>
 
@@ -976,11 +970,15 @@ function EditProductModal({ open, product, onClose, onSaved }) {
 /**
  * One product card in the batch form.
  *
- * The fields follow the type: viscosity exists only for oil, and the unit is a
- * disabled readout rather than a choice because it is derived from the type on the
- * server too. The grid is one column on a phone and two on a desktop, which is what
- * the `sm:grid-cols-2` does, and the opening-stock field spans both columns because
- * it carries a hint line of its own.
+ * Six fields, in the order the operator reads them: what it is, what it is called,
+ * who makes it, how thick it is (oil only), how it is counted and how big one pack
+ * is. Viscosity exists only for oil, and the unit is a disabled readout rather than
+ * a choice because it is derived from the type on the server too. The grid is one
+ * column on a phone and two on a desktop, which is what the `sm:grid-cols-2` does.
+ *
+ * Minimal quantity, cost price and opening stock are absent on purpose -- the card
+ * stays short, the product is created empty, and it is stocked afterwards through
+ * "Omborga qo'shish".
  */
 function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputRef, highlighted }) {
   const isOil = draft.type === 'oil';
@@ -996,7 +994,7 @@ function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputR
         highlighted ? 'border-[rgb(var(--c-primary))]/50' : 'border-white/10'
       }`}
     >
-      <div className="mb-4 flex items-center justify-between gap-3">
+      <div className="mb-3 flex items-center justify-between gap-3">
         <span className="flex h-7 min-w-7 items-center justify-center rounded-full border border-white/15 bg-white/[0.06] px-2 text-xs font-bold tabular-nums text-white/80">
           {index + 1}
         </span>
@@ -1012,7 +1010,7 @@ function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputR
         </button>
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-2">
         <div>
           <label className="label">Mahsulot turi *</label>
           <select className="field" value={draft.type} onChange={(e) => onChange(switchType(e.target.value))}>
@@ -1072,40 +1070,6 @@ function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputR
             placeholder={isOil ? '4' : '1'}
           />
           {hint('package_size')}
-        </div>
-        <div>
-          <label className="label">Minimal qoldiq</label>
-          <input
-            className={`field ${ring('minimum_quantity')}`}
-            inputMode="decimal"
-            value={draft.minimum_quantity}
-            onChange={field('minimum_quantity')}
-            placeholder={isOil ? '20' : '5'}
-          />
-          {hint('minimum_quantity')}
-        </div>
-        <div>
-          <label className="label">Kelish narxi (so&apos;m)</label>
-          <input
-            className={`field ${ring('cost_price')}`}
-            inputMode="decimal"
-            value={draft.cost_price}
-            onChange={field('cost_price')}
-            placeholder="45000"
-          />
-          {hint('cost_price')}
-        </div>
-        <div className="sm:col-span-2">
-          <label className="label">Boshlang&apos;ich qoldiq</label>
-          <input
-            className={`field ${ring('initial_quantity')}`}
-            inputMode="decimal"
-            value={draft.initial_quantity}
-            onChange={field('initial_quantity')}
-            placeholder="0"
-          />
-          <p className="mt-1 text-xs text-white/35">Kirim harakati sifatida yoziladi.</p>
-          {hint('initial_quantity')}
         </div>
       </div>
     </div>
