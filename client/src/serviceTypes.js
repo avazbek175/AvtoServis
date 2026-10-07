@@ -33,7 +33,7 @@ export function loadServiceTypes({ fresh = false } = {}) {
   if (inflight) return inflight;
   if (cached && !fresh) return Promise.resolve(cached);
   inflight = api
-    .get('/worklogs/services')
+    .get('/admin/worklogs/services')
     .then(({ services }) => {
       cached = (services || []).map((s) => s.name);
       return cached;

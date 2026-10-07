@@ -4576,6 +4576,54 @@ async function readinessTests() {
   check(JSON.stringify(p22Restored) === JSON.stringify(p22Before.filter((s) => Number(s.is_active) === 1).map((s) => s.name)),
     'P22.17 and the work-log select is back to the baseline six',
     JSON.stringify(p22Restored));
+
+  group('P22.18 Every literal GET the client makes reaches a real route');
+  // The client prefixes everything with `/api` (client/src/api.js) and the
+  // server mounts the work-log router at `/api/admin/worklogs`. A call written
+  // as `'/worklogs/services'` instead of `'/admin/worklogs/services'` sails past
+  // every router and lands on the `/api` catch-all, which answers 404
+  // "API route not found". Each half of that is correct on its own, so no unit
+  // test sees it -- only the two halves compared against each other do. This
+  // walks the client's literal `api.get('...')` calls and asks the server for
+  // each one: the catch-all answer means the path was never mounted. Paths
+  // built by concatenation or interpolation are skipped, because their real
+  // value only exists at run time.
+  const p22Files = (dir) => {
+    const found = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) found.push(...p22Files(full));
+      else if (/\.(js|jsx)$/.test(entry.name)) found.push(full);
+    }
+    return found;
+  };
+  const p22Gets = [];
+  for (const file of p22Files(srcRoot)) {
+    const src = fs.readFileSync(file, 'utf8');
+    const callRe = /api\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1/g;
+    for (const m of src.matchAll(callRe)) {
+      if (m[2].includes('${')) continue;
+      p22Gets.push({ file: path.relative(srcRoot, file), path: m[2] });
+    }
+  }
+  check(p22Gets.length >= 12,
+    'P22.18 the scan actually found the client catalogue calls',
+    JSON.stringify(p22Gets));
+  const p22ServiceCall = p22Gets.find((g) => g.file === 'serviceTypes.js');
+  check(!!p22ServiceCall && p22ServiceCall.path === '/admin/worklogs/services',
+    'P22.18 the service catalogue is requested where the work-log router is mounted',
+    JSON.stringify(p22ServiceCall));
+  const p22Unreachable = [];
+  for (const { file, path: p } of p22Gets) {
+    const res = await p22anon.get('/api' + p);
+    if (res.status === 404 && res.data && res.data.error === 'API route not found') {
+      p22Unreachable.push(`${file}: GET /api${p}`);
+    }
+  }
+  check(p22Unreachable.length === 0,
+    'P22.18 and none of them falls through to the "API route not found" catch-all',
+    JSON.stringify(p22Unreachable));
+
   await p22db.end();
 }
 
