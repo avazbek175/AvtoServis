@@ -1,0 +1,2568 @@
+openapi: 3.0.3
+info:
+  title: AvtoServis API
+  description: |
+    REST API for the AvtoServis auto-service platform (React SPA + Express + PostgreSQL).
+
+    Generated from the server source in `server/src/**` and `server/migrations/*.sql`.
+    Every path, field and status code below exists in the code.
+
+    ## Authentication
+
+    A successful `POST /api/auth/login` returns the session JWT in the
+    `Set-Cookie: avtoservis_token=...` response header (it is **not** in the body).
+    Native clients should send it back as `Authorization: Bearer <token>`;
+    the web client relies on the HttpOnly cookie.
+
+    ## Errors
+
+    Every error response is `{ "error": "human readable message" }`.
+    Messages are mostly in Uzbek and are verbatim from the server.
+
+    ## Timestamps
+
+    All `*_at` fields are UTC text in the fixed-width format `YYYY-MM-DD HH:MM:SS`.
+    Date query parameters use `YYYY-MM-DD`.
+
+    ## Money
+
+    Debt-ledger amounts are plain integer so'm. Inventory prices allow 2 decimals,
+    inventory quantities up to 3 decimals (filters must be whole numbers).
+  version: 1.0.0
+  contact:
+    name: AvtoServis
+servers:
+  - url: https://javohirautoservis.uz
+    description: Production (custom domain listed in server/.env.example)
+  - url: https://avtoservis-iota.vercel.app
+    description: Production (Vercel alias listed in server/.env.example)
+  - url: http://localhost:4000
+    description: Local development
+tags:
+  - name: Public
+    description: Unauthenticated endpoints
+  - name: Auth
+    description: Login, session and first-run setup
+  - name: Admin
+    description: Dashboard, settings, users, applications, media
+  - name: Services
+    description: Service catalogue
+  - name: Worklogs
+    description: Work log (ishlar) management
+  - name: Inventory
+    description: Oil and filter warehouse (super_admin only)
+  - name: Debts
+    description: Debt ledger (qarz daftari)
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+paths:
+  # ---------------------------------------------------------------- Public
+  /api/health:
+    get:
+      tags: [Public]
+      summary: Liveness probe
+      description: Deliberately returns no business data.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /api/public/settings:
+    get:
+      tags: [Public]
+      summary: Public site settings
+      description: Missing keys are backfilled from server defaults.
+      security: []
+      responses:
+        '200':
+          description: Settings grouped by section
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings:
+                    type: object
+                    additionalProperties: true
+                    example:
+                      site: { name: AvtoServis }
+                      worklog: { public_show: false }
+        '503': { $ref: '#/components/responses/DatabaseNotReady' }
+
+  /api/public/services:
+    get:
+      tags: [Public, Services]
+      summary: Active services
+      description: Active services only, ordered by `sort_order, id`.
+      security: []
+      responses:
+        '200':
+          description: Service list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items: { $ref: '#/components/schemas/PublicService' }
+        '503': { $ref: '#/components/responses/DatabaseNotReady' }
+
+  /api/public/services/{id}:
+    get:
+      tags: [Public, Services]
+      summary: One active service
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service: { $ref: '#/components/schemas/PublicService' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/public/worklogs:
+    get:
+      tags: [Public]
+      summary: Public work-log gallery
+      description: |
+        Returns `{ enabled: false, worklogs: [] }` unless the admin toggle
+        `worklog.public_show` is on. Only public and completed work logs are listed.
+      security: []
+      responses:
+        '200':
+          description: Public work logs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  worklogs:
+                    type: array
+                    items: { $ref: '#/components/schemas/PublicWorkLog' }
+
+  /api/media/{filename}:
+    get:
+      tags: [Public]
+      summary: Public media file
+      description: Redirects to the object-storage URL when configured, otherwise streams from disk.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Filename'
+      responses:
+        '302':
+          description: Redirect to the storage URL
+          headers:
+            Location: { schema: { type: string } }
+        '200':
+          description: File stream (disk storage)
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/workimages/{filename}:
+    get:
+      tags: [Public]
+      summary: Work-log image
+      description: |
+        Served without a session only when the work log is public **and**
+        `worklog.public_show` is enabled. Otherwise requires a session and the
+        caller must be `super_admin` or the owning master.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Filename'
+      responses:
+        '200':
+          description: Image bytes
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+            image/png:
+              schema: { type: string, format: binary }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Auth
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: |
+        `username` may be the username or the email address.
+        Sets the `avtoservis_token` cookie (HttpOnly, SameSite=Lax, Secure in
+        production, 7 days). Rate limited on **failed** attempts: 10 per account
+        and 50 per IP per 15 minutes by default.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: admin }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Logged in
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: 'avtoservis_token=<JWT>; Max-Age=604800; Path=/; HttpOnly'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Wrong credentials or missing fields
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Login yoki parol noto'g'ri }
+        '403':
+          description: Account deactivated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Hisob faolshtirilgan. Administrator bilan bog'laning }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out
+      description: Revokes the current session row and clears the cookie.
+      security: []
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      responses:
+        '200':
+          description: User
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/auth/setup-status:
+    get:
+      tags: [Auth]
+      summary: First-run setup status
+      security: []
+      responses:
+        '200':
+          description: Whether the first super admin still has to be created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  needsSetup: { type: boolean }
+
+  /api/auth/setup:
+    post:
+      tags: [Auth]
+      summary: Create the first super admin
+      description: |
+        Guarded by `SETUP_SECRET`, sent as `Authorization: Bearer <secret>` or
+        `X-Setup-Secret: <secret>`. In production, without a configured secret the
+        endpoint answers 503 (fail closed). Once a super admin exists the endpoint
+        stays closed.
+      security: []
+      parameters:
+        - name: X-Setup-Secret
+          in: header
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, username, email, password]
+              properties:
+                full_name: { type: string, minLength: 3 }
+                username: { type: string, pattern: '^[a-zA-Z0-9_]{3,30}$' }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, format: password }
+      responses:
+        '201':
+          description: Super admin created (session cookie is set)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Setup secret missing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Setup secret talab qilinadi }
+        '403':
+          description: Wrong secret, or a super admin already exists
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Username or email already taken
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Username yoki email band }
+        '503':
+          description: Setup disabled (no SETUP_SECRET in production)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/auth/apply:
+    post:
+      tags: [Auth]
+      summary: Apply to become a master
+      description: Creates a pending application reviewed by an admin.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, phone, email, username, password, specialty]
+              properties:
+                full_name: { type: string, minLength: 3 }
+                phone: { type: string }
+                email: { type: string, format: email }
+                username: { type: string, pattern: '^[a-zA-Z0-9_]{3,30}$' }
+                password: { type: string, minLength: 8, format: password }
+                specialty: { type: string }
+                message: { type: string, maxLength: 2000 }
+      responses:
+        '201':
+          description: Application submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  application: { $ref: '#/components/schemas/Application' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Login/email already registered or already applied for
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Admin
+  /api/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Dashboard statistics
+      description: Master accounts only see their own figures.
+      responses:
+        '200':
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats: { $ref: '#/components/schemas/DashboardStats' }
+                  visible: { $ref: '#/components/schemas/VisibleFlags' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/settings:
+    get:
+      tags: [Admin]
+      summary: All settings sections
+      description: |
+        Permission `content`. Note: the current handler returns
+        `{"settings":{},"keys":[]}` because the async value is not awaited —
+        use `GET /api/admin/settings/{key}` instead.
+      responses:
+        '200':
+          description: Settings (currently empty — see description)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings: { type: object, additionalProperties: true }
+                  keys: { type: array, items: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/settings/{key}:
+    get:
+      tags: [Admin]
+      summary: Read one settings section
+      description: Permission `content`.
+      parameters:
+        - $ref: '#/components/parameters/SettingsKey'
+      responses:
+        '200':
+          description: Section values (defaults merged in)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Admin]
+      summary: Save one settings section
+      description: |
+        Permission `content`; the `worklog` key additionally requires `super_admin`.
+        Send the section object itself or `{ "value": { ... } }`.
+        URLs must be relative or http(s); colours must be `#RGB`/`#RGBA`/`#RRGGBB`/`#RRGGBBAA`.
+      parameters:
+        - $ref: '#/components/parameters/SettingsKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Saved values
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings: { type: object, additionalProperties: true }
+        '400':
+          description: Unknown key or invalid value
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Missing `content` permission, or `worklog` without super admin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/admin/media:
+    get:
+      tags: [Admin]
+      summary: Media library
+      description: Permission `media`.
+      responses:
+        '200':
+          description: Media items, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  media:
+                    type: array
+                    items: { $ref: '#/components/schemas/MediaItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/uploads:
+    post:
+      tags: [Admin]
+      summary: Upload an image
+      description: |
+        Permission `media`. Accepts JPG, PNG, WEBP or AVIF up to 6 MB.
+        With object storage configured the bytes go straight to the bucket.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                prefix:
+                  type: string
+                  enum: [services, oils, promotions, gallery]
+                  default: gallery
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  media: { $ref: '#/components/schemas/MediaItem' }
+                  url: { type: string }
+        '400':
+          description: Missing file or unsupported MIME type
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                noFile: { value: { error: Fayl yuklanmadi } }
+                badMime: { value: { error: 'Faqat JPG, PNG, WEBP, AVIF rasmlari ruxsat etiladi' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/media/{id}:
+    delete:
+      tags: [Admin]
+      summary: Delete a media item
+      description: Permission `media`. Refused when the image is still referenced by the site.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Media not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Media topilmadi }
+        '409':
+          description: Image still in use
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: 'Bu rasm saytda ishlatilmoqda. Avval boshqa rasmni tanlang' }
+
+  /api/admin/users:
+    get:
+      tags: [Admin]
+      summary: List users
+      description: Super admin only. Super admins are listed first.
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Admin]
+      summary: Create a master account
+      description: 'Super admin only. Only `role: master` can be created.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, username, email, password]
+              properties:
+                full_name: { type: string, minLength: 3 }
+                username: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, format: password }
+                role: { type: string, enum: [master] }
+                permissions:
+                  type: array
+                  items: { type: string, enum: [content, services, media] }
+                is_active: { type: boolean, default: true }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Username or email taken
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Username yoki email band }
+
+  /api/admin/users/{id}:
+    put:
+      tags: [Admin]
+      summary: Update a user
+      description: |
+        Super admin only. A super admin can only edit their own record and cannot
+        demote or deactivate themselves; a second super admin cannot be created.
+        Setting `password` or deactivating revokes all of that user's sessions.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_name: { type: string }
+                username: { type: string }
+                email: { type: string, format: email }
+                role: { type: string, enum: [super_admin, master] }
+                password: { type: string, minLength: 8, format: password }
+                is_active: { type: boolean }
+                permissions:
+                  type: array
+                  items: { type: string, enum: [content, services, media] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Role/ownership rules violated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Admin]
+      summary: Delete a user
+      description: Super admin only. The last super admin cannot be removed.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Super admins cannot be deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Super adminni o'chirib bo'lmaydi }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Last super admin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Oxirgi super adminni o'chirib bo'lmaydi }
+
+  /api/admin/applications:
+    get:
+      tags: [Admin]
+      summary: List master applications
+      description: Super admin only.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, approved, rejected] }
+      responses:
+        '200':
+          description: Applications
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applications:
+                    type: array
+                    items: { $ref: '#/components/schemas/Application' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/applications/{id}/approve:
+    post:
+      tags: [Admin]
+      summary: Approve an application
+      description: Super admin only. Creates the master account in the same transaction.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Approved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  application: { $ref: '#/components/schemas/Application' }
+        '400':
+          description: Already reviewed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Bu ariza allaqachon ko'rib chiqilgan }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Application not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Ariza topilmadi }
+        '409':
+          description: Username or email already taken
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/applications/{id}/reject:
+    post:
+      tags: [Admin]
+      summary: Reject an application
+      description: Super admin only.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  application: { $ref: '#/components/schemas/Application' }
+        '400':
+          description: Already reviewed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Application not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/change-password:
+    post:
+      tags: [Admin]
+      summary: Change own password
+      description: |
+        Revokes **all** sessions of the caller and clears the cookie, so the
+        client must log in again (`reauth: true`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, format: password }
+                new_password: { type: string, minLength: 8, format: password }
+      responses:
+        '200':
+          description: Changed — re-login required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  reauth: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Current password wrong
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Joriy parol noto'g'ri }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/admin/health:
+    get:
+      tags: [Admin]
+      summary: Detailed health (super admin)
+      responses:
+        '200':
+          description: Health
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  users: { type: integer }
+                  services: { type: integer }
+                  sessions: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/diagnostics/queries:
+    get:
+      tags: [Admin]
+      summary: Query counter (super admin)
+      description: Only available when the server runs with `DB_TRACE_QUERIES=1`.
+      responses:
+        '200':
+          description: Query count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+        '404':
+          description: Tracing disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Query tracing yoqilgan (DB_TRACE_QUERIES=1) }
+
+  /api/admin/diagnostics/queries/reset:
+    post:
+      tags: [Admin]
+      summary: Reset the query counter (super admin)
+      responses:
+        '200':
+          description: Reset
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '404':
+          description: Tracing disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Services
+  /api/admin/services:
+    get:
+      tags: [Services]
+      summary: All services (including inactive)
+      description: Permission `services`.
+      responses:
+        '200':
+          description: Services
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items: { $ref: '#/components/schemas/Service' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Services]
+      summary: Create a service
+      description: Permission `services`. `sort_order` defaults to max+1.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string }
+                benefits: { type: string }
+                image: { type: string }
+                icon: { type: string, default: wrench }
+                price: { type: string, description: Free text, not a number }
+                sort_order: { type: integer }
+                is_active: { type: boolean, default: true }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service: { $ref: '#/components/schemas/Service' }
+        '400':
+          description: Name missing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Xizmat nomi kiritilishi shart }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/services/{id}:
+    put:
+      tags: [Services]
+      summary: Update a service
+      description: |
+        Permission `services`. Full replace: omitted fields keep their stored
+        values, so send the whole object.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service: { $ref: '#/components/schemas/Service' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Service not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Xizmat topilmadi }
+    delete:
+      tags: [Services]
+      summary: Delete a service
+      description: Permission `services`. Also removes an unreferenced storage object.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Service not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/services/reorder:
+    patch:
+      tags: [Services]
+      summary: Reorder services
+      description: Permission `services`. All-or-nothing; positions are 1-based in array order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer }
+                  example: [3, 1, 2]
+      responses:
+        '200':
+          description: Reordered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '400':
+          description: '`ids` is not an array'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Noto'g'ri so'rov }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- Worklogs
+  /api/admin/worklogs:
+    get:
+      tags: [Worklogs]
+      summary: Work-log list
+      description: |
+        Not paginated. A `master` only sees their own rows; a `super_admin` sees all.
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Matches title, customer name, car model, car brand
+        - name: service_type
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [Jarayonda, Tugallangan] }
+        - name: date_from
+          in: query
+          schema: { type: string, format: date }
+        - name: date_to
+          in: query
+          schema: { type: string, format: date }
+        - name: master_id
+          in: query
+          schema: { type: integer }
+          description: Super admin only
+      responses:
+        '200':
+          description: Work logs (each with `images` and `materials`)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  worklogs:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkLog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/DatabaseNotReady' }
+    post:
+      tags: [Worklogs]
+      summary: Create a work log
+      description: |
+        A master files for themselves; a super admin must send `master_id`.
+        `materials` (max 30) consume warehouse stock inside the same transaction
+        and require `super_admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkLogInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  work: { $ref: '#/components/schemas/WorkLog' }
+        '400':
+          description: Validation error (title, service type, status, price, materials)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Non-admin tried to consume stock
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Ombordan mahsulot sarflash faqat admin uchun }
+        '409':
+          description: Insufficient stock for a listed material
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/worklogs/stats:
+    get:
+      tags: [Worklogs]
+      summary: Work-log statistics
+      parameters:
+        - name: master_id
+          in: query
+          schema: { type: integer }
+          description: Super admin only
+        - name: service_type
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats: { $ref: '#/components/schemas/WorkLogStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/worklogs/services:
+    get:
+      tags: [Worklogs, Services]
+      summary: Service picker for the work-log form
+      description: Active services only, in catalogue order. Never a hard-coded list.
+      responses:
+        '200':
+          description: Picker entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        name: { type: string }
+                        icon: { type: string }
+                        sort_order: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/worklogs/{id}:
+    get:
+      tags: [Worklogs]
+      summary: Work-log detail
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Work log with images and materials
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  work: { $ref: '#/components/schemas/WorkLog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Work log not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Ish topilmadi }
+    put:
+      tags: [Worklogs]
+      summary: Update a work log
+      description: |
+        Omitted fields keep their stored values. An unchanged `service_type` is
+        always accepted (even the retired `Mator xodovoy`); a changed one must
+        resolve to an active catalogue service. Only a super admin may change `is_public`.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkLogInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  work: { $ref: '#/components/schemas/WorkLog' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Work log not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Worklogs]
+      summary: Delete a work log
+      description: Cascades to images; storage objects are removed afterwards.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Work log not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/worklogs/{id}/images:
+    post:
+      tags: [Worklogs]
+      summary: Upload work photos
+      description: |
+        Multipart field name is `files`. Up to 10 files per request, 5 MB each,
+        JPG/JPEG/PNG/WEBP/AVIF. Maximum 15 images per work log.
+        Requires ownership (or super admin).
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  items: { type: string, format: binary }
+      responses:
+        '201':
+          description: Complete image list for the work log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  images:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkImage' }
+        '400':
+          description: Too many/too large files, wrong type, or no file
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Work log not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/worklogs/images/{imageId}:
+    delete:
+      tags: [Worklogs]
+      summary: Delete a work photo
+      parameters:
+        - name: imageId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Deleted — returns the remaining images
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  images:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkImage' }
+        '400':
+          description: Invalid image id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Noto'g'ri rasm ID }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Inventory
+  /api/admin/inventory/stats:
+    get:
+      tags: [Inventory]
+      summary: Warehouse statistics
+      responses:
+        '200':
+          description: Stats, low-stock preview and recent movements
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats: { $ref: '#/components/schemas/InventoryStats' }
+                  low_stock:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  recent_movements:
+                    type: array
+                    items: { $ref: '#/components/schemas/Movement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/inventory/low-stock:
+    get:
+      tags: [Inventory]
+      summary: Products at or below the minimum
+      responses:
+        '200':
+          description: Products
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/inventory/products:
+    get:
+      tags: [Inventory]
+      summary: Product list
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - name: filter
+          in: query
+          schema: { type: string, enum: [all, active, inactive, low, out], default: all }
+        - name: type
+          in: query
+          schema: { type: string, enum: [all, oil, filter], default: all }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [name, newest, oldest, quantity, price], default: name }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Matches name, brand, viscosity
+      responses:
+        '200':
+          description: Products with pagination
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Inventory]
+      summary: Create a product
+      description: |
+        `unit` is derived from `type` (oil -> liter, filter -> piece).
+        `initial_quantity` (alias `current_quantity`) seeds opening stock with a
+        matching purchase movement.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product: { $ref: '#/components/schemas/Product' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/inventory/products/bulk:
+    post:
+      tags: [Inventory]
+      summary: Create up to 20 products atomically
+      description: |
+        All products are inserted in one transaction — either every item lands or
+        none does. Failures are reported with the item position:
+        `2-mahsulot: <original message>`. Duplicate names are allowed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [products]
+              properties:
+                products:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  items: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  products:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/inventory/products/{id}:
+    get:
+      tags: [Inventory]
+      summary: Product detail
+      description: Includes up to 200 movements, 200 audit rows, 100 material usages and a ledger reconciliation.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product: { $ref: '#/components/schemas/Product' }
+                  totals:
+                    type: object
+                    description: Recomputed from the movement ledger
+                    properties:
+                      current_quantity: { type: number }
+                      ledger_total: { type: number }
+                      purchased: { type: number }
+                      consumed: { type: number }
+                      adjusted: { type: number }
+                      movements: { type: integer }
+                      consistent: { type: boolean }
+                  movements:
+                    type: array
+                    items: { $ref: '#/components/schemas/Movement' }
+                  service_materials:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  audit_logs:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditLog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Mahsulot topilmadi }
+    patch:
+      tags: [Inventory]
+      summary: Update product metadata
+      description: |
+        Validates the merged row. `current_quantity` cannot be changed here —
+        stock only moves through stock-in / consume / adjust.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product: { $ref: '#/components/schemas/Product' }
+        '400':
+          description: Invalid merged row, or direct quantity change attempted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                directQty:
+                  value: { error: "Qoldiqni to'g'ridan-to'g'ri o'zgartirib bo'lmaydi. Omborga qo'shish, sarf yoki tuzatishdan foydalaning." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Inventory]
+      summary: Delete a product
+      description: Refused once the product has any movement or service-material history.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Product has history — deactivate instead
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "Bu mahsulotning ombor harakati mavjud, shuning uchun o'chirib bo'lmaydi. Uni arxivlang (aktiv/deaktiv)." }
+
+  /api/admin/inventory/products/{id}/stock-in:
+    post:
+      tags: [Inventory]
+      summary: Stock in (purchase)
+      description: Adds stock and appends a `purchase` movement in one transaction.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: number, description: 'Up to 3 decimals; filters must be whole' }
+                note: { type: string, maxLength: 500 }
+                supplier: { type: string, maxLength: 150, description: Appended to the note }
+      responses:
+        '201':
+          description: Stock added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product: { $ref: '#/components/schemas/Product' }
+                  movement: { $ref: '#/components/schemas/Movement' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Product archived, or stock went negative
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/inventory/products/{id}/consume:
+    post:
+      tags: [Inventory]
+      summary: Consume stock
+      description: Quantity must be positive; the negative sign is applied server-side.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: number }
+                note: { type: string, maxLength: 500 }
+      responses:
+        '201':
+          description: Stock consumed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product: { $ref: '#/components/schemas/Product' }
+                  movement: { $ref: '#/components/schemas/Movement' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Insufficient stock
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/inventory/products/{id}/adjust:
+    post:
+      tags: [Inventory]
+      summary: Stock take / adjustment
+      description: |
+        Send either `current_quantity` (absolute shelf count) or a signed
+        `quantity` (delta). `reason` is mandatory.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, maxLength: 300 }
+                current_quantity: { type: number, description: Absolute count }
+                quantity: { type: number, description: Signed delta, e.g. -2.5 }
+      responses:
+        '201':
+          description: Adjustment recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product: { $ref: '#/components/schemas/Product' }
+                  movement: { $ref: '#/components/schemas/Movement' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Stock would go negative
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/inventory/movements:
+    get:
+      tags: [Inventory]
+      summary: Movement history
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - name: type
+          in: query
+          schema: { type: string, enum: [oil, filter] }
+        - name: movement_type
+          in: query
+          schema: { type: string, enum: [purchase, consumption, adjustment] }
+        - name: product_id
+          in: query
+          schema: { type: integer }
+        - name: date_from
+          in: query
+          schema: { type: string, format: date }
+        - name: date_to
+          in: query
+          schema: { type: string, format: date }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Matches product name, brand, movement note
+      responses:
+        '200':
+          description: Movements
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  movements:
+                    type: array
+                    items: { $ref: '#/components/schemas/Movement' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400':
+          description: Malformed date
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "Sana noto'g'ri formatda (masalan 2026-10-05)" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/inventory/export.csv:
+    get:
+      tags: [Inventory]
+      summary: Product list CSV export
+      responses:
+        '200':
+          description: CSV attachment (UTF-8 BOM)
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/inventory/movements/export.csv:
+    get:
+      tags: [Inventory]
+      summary: Movement history CSV export
+      responses:
+        '200':
+          description: CSV attachment (UTF-8 BOM)
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- Debts
+  /api/admin/debts:
+    get:
+      tags: [Debts]
+      summary: Debt list
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - name: filter
+          in: query
+          schema: { type: string, enum: [all, unpaid, partially_paid, paid, archive], default: all }
+        - name: status
+          in: query
+          description: Alias for `filter`
+          schema: { type: string, enum: [all, unpaid, partially_paid, paid, archive] }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [newest, oldest, largest, remaining], default: newest }
+        - name: q
+          in: query
+          description: Matches full name, phone, service
+          schema: { type: string }
+        - name: search
+          in: query
+          description: Alias for `q`
+          schema: { type: string }
+      responses:
+        '200':
+          description: Debts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  debts:
+                    type: array
+                    items: { $ref: '#/components/schemas/Debt' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  archived: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/DatabaseNotReady' }
+    post:
+      tags: [Debts]
+      summary: Create a debt
+      description: |
+        `debt_amount` must be a positive integer. An opening `paid_amount` also
+        creates a payment row so the payment ledger always reconciles.
+        `address` in the body is accepted and discarded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, phone, service, debt_amount]
+              properties:
+                full_name: { type: string, maxLength: 200 }
+                phone: { type: string, maxLength: 60 }
+                service: { type: string, maxLength: 300 }
+                description: { type: string, maxLength: 4000 }
+                debt_amount: { type: integer, minimum: 1 }
+                paid_amount: { type: integer, minimum: 0 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  debt: { $ref: '#/components/schemas/Debt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/DatabaseNotReady' }
+
+  /api/admin/debts/stats:
+    get:
+      tags: [Debts]
+      summary: Debt statistics (live rows only)
+      responses:
+        '200':
+          description: Stats
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DebtStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/debts/export.csv:
+    get:
+      tags: [Debts]
+      summary: CSV export of the current view
+      description: Honours `filter`, `sort` and `q`; pagination is ignored.
+      responses:
+        '200':
+          description: CSV attachment
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/debts/export.xlsx:
+    get:
+      tags: [Debts]
+      summary: Excel export (debts, payments, audit sheets)
+      description: |
+        Three sheets plus totals. Honours `filter`, `sort` and `q`.
+        Extra response headers: `X-Export-Rows`, `X-Export-Filter`.
+      responses:
+        '200':
+          description: XLSX attachment
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/admin/debts/{id}:
+    get:
+      tags: [Debts]
+      summary: Debt detail with payments and audit trail
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Debt
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  debt: { $ref: '#/components/schemas/Debt' }
+                  payments:
+                    type: array
+                    items: { $ref: '#/components/schemas/DebtPayment' }
+                  audit_logs:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditLog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Debt not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Qarz topilmadi }
+    patch:
+      tags: [Debts]
+      summary: Edit a debt
+      description: |
+        Editable: `full_name`, `phone`, `service`, `description`, `debt_amount`.
+        `paid_amount` is **not** editable here. A changed `service` must be an
+        active catalogue service.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_name: { type: string, maxLength: 200 }
+                phone: { type: string, maxLength: 60 }
+                service: { type: string, maxLength: 300 }
+                description: { type: string, maxLength: 4000 }
+                debt_amount: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  debt: { $ref: '#/components/schemas/Debt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Debt not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Archived, or the new amount is below what was paid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Debts]
+      summary: Archive a debt (soft delete)
+      description: |
+        Requires a fully settled debt and the server-side delete pass key.
+        Checks: session -> rate limit -> exists -> not archived -> settled -> pass key.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+        - $ref: '#/components/parameters/DebtPassKey'
+      responses:
+        '200':
+          description: Archived
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  debt: { $ref: '#/components/schemas/Debt' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Wrong or missing pass key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Pass key noto'g'ri }
+        '404':
+          description: Debt not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Already archived, or not fully paid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: No pass key configured on the server (deletion disabled)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/debts/{id}/payments:
+    post:
+      tags: [Debts]
+      summary: Record a payment
+      description: |
+        `amount` must be a positive integer not exceeding the remaining balance.
+        The debt row is locked (`FOR UPDATE`) so concurrent payments serialise.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 1 }
+                note: { type: string, maxLength: 1000 }
+      responses:
+        '201':
+          description: Payment recorded — returns the updated debt
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  debt: { $ref: '#/components/schemas/Debt' }
+        '400':
+          description: Invalid amount or above the remaining balance
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Debt not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Debt archived
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Bu qarz arxivlangan. }
+
+  /api/admin/debts/{id}/mark-paid:
+    post:
+      tags: [Debts]
+      summary: Mark a debt fully paid
+      description: Inserts a payment for the outstanding remainder so the ledger reconciles.
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+      responses:
+        '200':
+          description: Settled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  debt: { $ref: '#/components/schemas/Debt' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Debt not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Debt archived
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/admin/debts/{id}/purge:
+    post:
+      tags: [Debts]
+      summary: Permanently delete a debt
+      description: |
+        Super admin **and** pass key required. Refused when the debt ever received
+        a payment (the payment ledger is append-only).
+      parameters:
+        - $ref: '#/components/parameters/PathId'
+        - $ref: '#/components/parameters/DebtPassKey'
+      responses:
+        '200':
+          description: Purged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  purged: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Wrong pass key, or not a super admin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Debt not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Unsettled debt, or it has payments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: No pass key configured on the server
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Session JWT obtained from the `Set-Cookie` response header of
+        `POST /api/auth/login`. Recommended for native clients.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: avtoservis_token
+      description: HttpOnly session cookie used by the web client (7-day lifetime).
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    Filename:
+      name: filename
+      in: path
+      required: true
+      schema: { type: string }
+    SettingsKey:
+      name: key
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [site, hero, about, contact, design, footer, worklog]
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PerPage:
+      name: per_page
+      in: query
+      schema: { type: integer, minimum: 5, maximum: 100, default: 20 }
+    DebtPassKey:
+      name: X-Debt-Pass-Key
+      in: header
+      required: false
+      schema: { type: string }
+      description: |
+        Server-side shared secret required to archive or purge a debt.
+        Also accepted in the JSON body as `pass_key`.
+        Use this header — `Authorization` carries the session token.
+
+  responses:
+    BadRequest:
+      description: Validation error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: No session, invalid session, or expired session
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Conflicts with the current state
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many failed attempts
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until the bucket resets
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DatabaseNotReady:
+      description: Database is not ready (cold start / migration in progress) — retry with backoff
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: Database is not ready }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable message (mostly Uzbek, verbatim from the server)
+        retryAfter:
+          type: integer
+          description: Present on 429 responses
+
+    Ok:
+      type: object
+      properties:
+        ok: { type: boolean, example: true }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+        pages: { type: integer }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        full_name: { type: string }
+        username: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [super_admin, master] }
+        permissions:
+          type: array
+          items: { type: string, enum: [content, services, media] }
+        is_active: { type: boolean }
+        created_at: { type: string, example: '2026-01-05 09:14:02' }
+
+    Application:
+      type: object
+      properties:
+        id: { type: integer }
+        full_name: { type: string }
+        phone: { type: string }
+        email: { type: string }
+        username: { type: string }
+        specialty: { type: string }
+        message: { type: string }
+        status: { type: string, enum: [pending, approved, rejected] }
+        rejection_reason: { type: string }
+        created_at: { type: string }
+        reviewed_at: { type: string, nullable: true }
+        reviewed_by: { type: integer, nullable: true }
+        reviewed_by_name: { type: string }
+
+    Service:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string }
+        benefits: { type: string }
+        image: { type: string }
+        icon: { type: string, example: wrench }
+        price: { type: string, description: Free text, not a number }
+        sort_order: { type: integer }
+        is_active: { type: integer, enum: [0, 1] }
+        created_at: { type: string }
+
+    ServiceInput:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        benefits: { type: string }
+        image: { type: string }
+        icon: { type: string }
+        price: { type: string }
+        sort_order: { type: integer }
+        is_active: { type: boolean }
+
+    PublicService:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string }
+        benefits: { type: string }
+        image: { type: string }
+        icon: { type: string }
+        price: { type: string }
+
+    MediaItem:
+      type: object
+      properties:
+        id: { type: integer }
+        filename: { type: string }
+        original_name: { type: string }
+        mime: { type: string }
+        size: { type: integer }
+        object_key: { type: string }
+        url: { type: string, description: Absolute storage URL or `/api/media/<filename>` }
+        created_at: { type: string }
+
+    WorkLog:
+      type: object
+      properties:
+        id: { type: integer }
+        master_id: { type: integer }
+        master_name: { type: string }
+        title: { type: string }
+        customer_name: { type: string }
+        customer_phone: { type: string }
+        car_brand: { type: string }
+        car_model: { type: string }
+        car_number: { type: string }
+        service_type:
+          type: string
+          description: Text value matching `services.name` (not an id)
+        description: { type: string }
+        start_date: { type: string }
+        end_date: { type: string }
+        price: { type: number }
+        status: { type: string, enum: [Jarayonda, Tugallangan] }
+        is_public: { type: integer, enum: [0, 1] }
+        notes: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/WorkImage' }
+        materials:
+          type: array
+          items: { $ref: '#/components/schemas/Material' }
+
+    WorkLogInput:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, maxLength: 200 }
+        service_type:
+          type: string
+          description: Must match an active `services.name` when changed
+        status: { type: string, enum: [Jarayonda, Tugallangan], default: Jarayonda }
+        price: { type: number, minimum: 0, maximum: 1000000000000 }
+        customer_name: { type: string, maxLength: 150 }
+        customer_phone: { type: string, maxLength: 40 }
+        car_brand: { type: string, maxLength: 80 }
+        car_model: { type: string, maxLength: 80 }
+        car_number: { type: string, maxLength: 30 }
+        description: { type: string, maxLength: 5000 }
+        start_date: { type: string }
+        end_date: { type: string }
+        notes: { type: string, maxLength: 2000 }
+        master_id:
+          type: integer
+          description: Required for super admin; ignored for a master
+        is_public:
+          type: boolean
+          description: Super admin only
+        materials:
+          type: array
+          maxItems: 30
+          description: Consumes warehouse stock — super admin only
+          items:
+            type: object
+            required: [product_id, quantity]
+            properties:
+              product_id: { type: integer }
+              quantity: { type: number }
+              note: { type: string, maxLength: 200 }
+
+    WorkImage:
+      type: object
+      properties:
+        id: { type: integer }
+        image_path: { type: string, description: Use as `/api/workimages/<image_path>` }
+        original_filename: { type: string }
+
+    PublicWorkLog:
+      type: object
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        service_type: { type: string }
+        car_brand: { type: string }
+        car_model: { type: string }
+        description: { type: string }
+        created_at: { type: string }
+        master_name: { type: string }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              image_path: { type: string }
+
+    Material:
+      type: object
+      properties:
+        id: { type: integer }
+        work_log_id: { type: integer }
+        product_id: { type: integer }
+        quantity: { type: number }
+        movement_id: { type: integer }
+        product_name: { type: string }
+        product_type: { type: string, enum: [oil, filter] }
+        brand: { type: string }
+        viscosity: { type: string }
+        unit: { type: string, enum: [liter, piece] }
+
+    WorkLogStats:
+      type: object
+      properties:
+        total: { type: integer }
+        completed: { type: integer }
+        inProgress: { type: integer }
+        earnings: { type: number }
+
+    DashboardStats:
+      type: object
+      properties:
+        totalServices: { type: integer }
+        activeServices: { type: integer }
+        masters: { type: integer }
+        mastersActive: { type: integer }
+        mediaCount: { type: integer }
+        debtTotal: { type: integer }
+        debtOutstanding: { type: integer }
+        debtTotalDebtors: { type: integer }
+        debtCreatedToday: { type: integer }
+        pendingApplications:
+          type: integer
+          description: Present only for super_admin
+
+    VisibleFlags:
+      type: object
+      additionalProperties: { type: boolean }
+
+    Product:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        type: { type: string, enum: [oil, filter] }
+        brand: { type: string }
+        viscosity: { type: string, description: Required for oil, empty for filter }
+        unit: { type: string, enum: [liter, piece], description: Derived from type }
+        package_size: { type: number }
+        current_quantity: { type: number }
+        minimum_quantity: { type: number }
+        cost_price: { type: number }
+        markup_amount: { type: number }
+        sale_price:
+          type: number
+          description: Computed by the database as `cost_price + markup_amount`
+        is_active: { type: integer, enum: [0, 1] }
+        created_at: { type: string }
+        updated_at: { type: string }
+        state: { type: string, enum: [ok, low, out] }
+        state_label: { type: string, enum: ['Yetarli', Kam, Tugagan] }
+
+    ProductInput:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string, maxLength: 150 }
+        type: { type: string, enum: [oil, filter] }
+        brand: { type: string, maxLength: 80 }
+        viscosity: { type: string, maxLength: 30 }
+        unit:
+          type: string
+          enum: [liter, piece]
+          description: Optional; must match the type if sent
+        package_size: { type: number }
+        minimum_quantity: { type: number }
+        cost_price: { type: number }
+        markup_amount: { type: number }
+        initial_quantity:
+          type: number
+          description: Opening stock (alias `current_quantity`)
+        current_quantity:
+          type: number
+          description: Alias of `initial_quantity` on create; must not change on update
+        is_active: { type: boolean }
+
+    Movement:
+      type: object
+      properties:
+        id: { type: integer }
+        product_id: { type: integer }
+        movement_type: { type: string, enum: [purchase, consumption, adjustment] }
+        quantity: { type: number, description: Signed — consumption is negative }
+        before_quantity: { type: number }
+        after_quantity: { type: number }
+        reference_type: { type: string, enum: [work_log, manual, stocktake], nullable: true }
+        reference_id: { type: integer, nullable: true }
+        admin_id: { type: integer, nullable: true }
+        note: { type: string }
+        created_at: { type: string }
+        product_name: { type: string }
+        product_type: { type: string, enum: [oil, filter] }
+        unit: { type: string }
+        admin_name: { type: string }
+        movement_label: { type: string, enum: [Kirim, Sarf, Tuzatish] }
+        reference_label: { type: string }
+
+    InventoryStats:
+      type: object
+      properties:
+        oilTotal: { type: number }
+        oilConsumed: { type: number }
+        oilPurchased: { type: number }
+        oilAdjusted: { type: number }
+        oilValue: { type: number }
+        filterTotal: { type: number }
+        filterConsumed: { type: number }
+        filterPurchased: { type: number }
+        filterAdjusted: { type: number }
+        filterValue: { type: number }
+        oilProducts: { type: integer }
+        filterProducts: { type: integer }
+        inactiveProducts: { type: integer }
+        outOfStock: { type: integer }
+        lowStock: { type: integer }
+        oilMinimum: { type: number }
+        filterMinimum: { type: number }
+
+    Debt:
+      type: object
+      properties:
+        id: { type: integer }
+        full_name: { type: string }
+        phone: { type: string }
+        service: { type: string }
+        description: { type: string }
+        debt_amount: { type: integer, description: Integer so'm }
+        paid_amount: { type: integer }
+        remaining_amount: { type: integer, description: Generated column — never sent by clients }
+        status: { type: string, enum: [unpaid, partially_paid, paid] }
+        status_label: { type: string, enum: ["To'lanmagan", "Qisman to'langan", "To'langan"] }
+        created_at: { type: string }
+        updated_at: { type: string }
+        deleted_at: { type: string, nullable: true }
+
+    DebtPayment:
+      type: object
+      properties:
+        id: { type: integer }
+        amount: { type: integer }
+        note: { type: string }
+        created_at: { type: string }
+        created_by: { type: integer, nullable: true }
+        created_by_name: { type: string }
+
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        debt_id: { type: integer, nullable: true }
+        product_id: { type: integer, nullable: true }
+        action: { type: string }
+        admin_id: { type: integer, nullable: true }
+        admin_name: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string }
+
+    DebtStats:
+      type: object
+      properties:
+        totalDebtors: { type: integer }
+        totalDebt: { type: integer }
+        totalRemaining: { type: integer }
+        totalPaid: { type: integer }
+        openDebtors: { type: integer }
+        partialDebtors: { type: integer }
+        paidDebtors: { type: integer }
+        createdToday: { type: integer }
+        archived: { type: integer }
