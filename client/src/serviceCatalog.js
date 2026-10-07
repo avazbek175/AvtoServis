@@ -4,9 +4,17 @@
  * Deliberately free of JSX and of React, so the places that are easy to get wrong
  * -- "is Mator a separate option from Xodovoy", "does the retired combined name
  * still appear" -- are plain data that can be asserted directly instead of being
- * read out of a rendered component. `DebtLedger.jsx`, `WorkLogs.jsx`,
- * `AdminLogin.jsx`, `Footer.jsx` and `WorkGallery.jsx` all draw from here, so a
- * catalogue change is one edit and cannot leave one screen behind.
+ * read out of a rendered component.
+ *
+ * This module is the *bundled* half: the baseline six, their icons, and the rules
+ * for a value the catalogue no longer carries. The lists the screens actually
+ * offer come from the server (client/src/serviceTypes.js, backed by the `services`
+ * table that /admin/services edits), because an admin who adds a service there
+ * expects the work-log and debt pickers to offer it without a deploy. Both halves
+ * are used together: `serviceOptions(current, names)` takes the live list and
+ * falls back to the baseline below when it has not arrived yet. `DebtLedger.jsx`,
+ * `WorkLogs.jsx`, `AdminLogin.jsx`, `Footer.jsx` and `WorkGallery.jsx` all draw
+ * from here, so a catalogue change is one edit and cannot leave one screen behind.
  *
  * The server owns the authoritative rules (`server/src/routes/worklogs.js` for
  * work-log service types, the `services` table for the catalogue itself). This
@@ -59,13 +67,20 @@ export function isServiceName(name) {
  * its own value is offered back, labelled as legacy, and the operator has to
  * actively pick something else to change it.
  *
+ * `names` is the live catalogue (client/src/serviceTypes.js), so the work-log
+ * and debt pickers follow the services the admin has actually added. Left out it
+ * falls back to the bundled baseline six -- the guaranteed floor while that
+ * request is in flight or has failed.
+ *
  * @param {string} current value already on the record
+ * @param {string[]} [names] active service names, in catalogue order
  * @returns {{ value: string, label: string, legacy: boolean }[]}
  */
-export function serviceOptions(current) {
+export function serviceOptions(current, names) {
   const cur = String(current == null ? '' : current).trim();
-  const options = SERVICE_NAMES.map((name) => ({ value: name, label: name, legacy: false }));
-  if (cur && !SERVICE_NAMES.includes(cur)) {
+  const list = Array.isArray(names) ? names.map((n) => String(n)) : SERVICE_NAMES;
+  const options = list.map((name) => ({ value: name, label: name, legacy: false }));
+  if (cur && !list.includes(cur)) {
     options.unshift({ value: cur, label: `${cur} (eski)`, legacy: true });
   }
   return options;

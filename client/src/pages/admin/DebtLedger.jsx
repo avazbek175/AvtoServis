@@ -3,6 +3,7 @@ import { api } from '../../api';
 import Icon from '../../components/icons';
 import { Loading, Alert, Badge, Modal, ConfirmDialog } from '../../components/ui';
 import { serviceOptions } from '../../serviceCatalog';
+import { useServiceTypes } from '../../serviceTypes';
 
 const STATUS_META = {
   unpaid: { label: "To'lanmagan", badge: 'danger', row: 'bg-red-500/[0.04]' },
@@ -364,9 +365,11 @@ function ExcelExportButton({ filter, sort, search, onError }) {
  *
  * A free-text field let the ledger collect "Moy", "Balans" and "Tormoz" for what
  * is really the same three services, and it is the field a debt is grouped and
- * read by. The list is the shop's catalogue, in one place
- * (client/src/serviceCatalog.js), so the form, the footer and the work-log form
- * cannot drift apart.
+ * read by. The list is the shop's catalogue, read live from the `services` table
+ * that /admin/services edits (client/src/serviceTypes.js), so a service added
+ * there is choosable here without a deploy; `serviceOptions` supplies the rules
+ * and the bundled baseline while that request is in flight or has failed, so the
+ * form is never left with an empty select.
  *
  * A value already on a record but no longer in the catalogue is appended, marked
  * "(eski)". Dropping it would make the select render blank for a debt the operator
@@ -374,14 +377,23 @@ function ExcelExportButton({ filter, sort, search, onError }) {
  * is offered back and only changes if somebody actively picks a new one.
  */
 function ServiceSelect({ value, onChange, required = false, disabled = false }) {
-  const options = serviceOptions(value);
+  const { names, error, reload } = useServiceTypes({ fresh: true });
+  const options = serviceOptions(value, names);
   return (
-    <select className="field" value={value} onChange={onChange} required={required} disabled={disabled}>
-      <option value="" disabled className="bg-[#111725]">[Xizmatni tanlang ▼]</option>
-      {options.map((o) => (
-        <option key={o.value} value={o.value} className="bg-[#111725]">{o.label}</option>
-      ))}
-    </select>
+    <>
+      <select className="field" value={value} onChange={onChange} required={required} disabled={disabled}>
+        <option value="" disabled className="bg-[#111725]">[Xizmatni tanlang ▼]</option>
+        {options.map((o) => (
+          <option key={o.value} value={o.value} className="bg-[#111725]">{o.label}</option>
+        ))}
+      </select>
+      {error && (
+        <p className="mt-1 text-xs text-white/40">
+          Xizmatlar ro'yxatini yanglab bo'lmadi: {error}.{' '}
+          <button type="button" onClick={reload} className="underline">Qayta urinish</button>
+        </p>
+      )}
+    </>
   );
 }
 

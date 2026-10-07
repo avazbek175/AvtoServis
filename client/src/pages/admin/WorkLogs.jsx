@@ -3,9 +3,9 @@ import { api } from '../../api';
 import { useAdmin } from '../../store';
 import Icon from '../../components/icons';
 import { Loading, Alert, Badge, Modal, Toggle, ConfirmDialog, EmptyState, Spinner } from '../../components/ui';
-import { SERVICE_NAMES } from '../../serviceCatalog';
+import { SERVICE_NAMES, serviceOptions } from '../../serviceCatalog';
+import { useServiceTypes } from '../../serviceTypes';
 
-const SERVICE_TYPES = SERVICE_NAMES;
 const STATUSES = ['Jarayonda', 'Tugallangan'];
 
 function fmt(c) {
@@ -27,6 +27,12 @@ export default function WorkLogs() {
   const [busy, setBusy] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [savingPublic, setSavingPublic] = useState(false);
+  // The catalogue the "Xizmat turi" filter is built from. The bundled baseline
+  // seeds it so the control is never blank on first paint; the server's answer
+  // replaces it wholesale the moment it arrives -- including an empty one, which
+  // is how "every service has been switched off" reaches this screen.
+  const { names: serviceTypes, error: servicesError, reload: reloadServices } =
+    useServiceTypes({ fallback: SERVICE_NAMES });
 
   useEffect(() => {
     loadStats();
@@ -142,7 +148,9 @@ export default function WorkLogs() {
           <label className="label">Xizmat turi</label>
           <select className="field" value={filters.service_type} onChange={(e) => setFilter('service_type', e.target.value)}>
             <option value="" className="bg-[#111725]">Barchasi</option>
-            {SERVICE_TYPES.map((s) => <option key={s} value={s} className="bg-[#111725]">{s}</option>)}
+            {serviceOptions(filters.service_type, serviceTypes).map((o) => (
+              <option key={o.value} value={o.value} className="bg-[#111725]">{o.label}</option>
+            ))}
           </select>
         </div>
         <div>
@@ -297,6 +305,20 @@ const EMPTY_FORM = {
 function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
   const isEdit = !!initial.id;
   const [form, setForm] = useState({ ...EMPTY_FORM, master_id: masters.length ? masters[0].id : '', ...initial, is_public: !!initial.is_public });
+  // Fresh on every open: an admin who has just added "Mator Ochish" on
+  // /admin/services expects this modal to offer it on the next open. No fallback
+  // on purpose -- while the request is in flight the select says so, instead of
+  // showing a list that may already be out of date.
+  const {
+    names: serviceTypes,
+    loading: servicesLoading,
+    error: servicesError,
+    reload: reloadServices,
+  } = useServiceTypes({ fresh: true });
+  // A value already on the record that the catalogue no longer carries (renamed
+  // or retired since it was filed) is still offered back, marked "(eski)", so an
+  // edit never opens on a blank select and never rewrites what it did not touch.
+  const serviceList = serviceTypes ? serviceOptions(form.service_type, serviceTypes) : [];
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   const [images, setImages] = useState(initial._images || initial.images || []);
@@ -416,7 +438,14 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
   return (
     <Modal open onClose={onClose} title={isEdit ? 'Ishni tahrirlash' : 'Yangi ish qo\'shish'} wide>
       <form onSubmit={save} className="space-y-4">
-        {error && <Alert>{error}</Alert>}
+      {error && <Alert>{error}</Alert>}
+
+      {servicesError && (
+        <Alert>
+          Xizmatlar ro'yxatini yanglab bo'lmadi: {servicesError}.{' '}
+          <button type="button" onClick={reloadServices} className="font-semibold underline">Qayta urinish</button>
+        </Alert>
+      )}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="sm:col-span-2">
@@ -453,10 +482,40 @@ function WorkForm({ isSA, initial, masters, onClose, onSaved }) {
           </div>
           <div>
             <label className="label">Xizmat turi *</label>
-            <select className="field" value={form.service_type} onChange={set('service_type')} required>
-              <option value="" className="bg-[#111725]">Tanlang...</option>
-              {SERVICE_TYPES.map((s) => <option key={s} value={s} className="bg-[#111725]">{s}</option>)}
+            <select
+              className="field"
+              value={form.service_type}
+              onChange={set('service_type')}
+              required
+              disabled={servicesLoading || serviceList.length === 0}
+            >
+              {servicesLoading ? (
+                <option value="" className="bg-[#111725]">Yuklanmoqda...</option>
+              ) : serviceList.length === 0 ? (
+                <option value="" className="bg-[#111725]">
+                  {servicesError ? 'Xizmatlar yuklanmadi' : "Faol xizmat yo'q"}
+                </option>
+              ) : (
+                <>
+                  {!form.service_type && <option value="" className="bg-[#111725]">Tanlang...</option>}
+                  {serviceList.map((o) => (
+                    <option key={o.value} value={o.value} className="bg-[#111725]">{o.label}</option>
+                  ))}
+                </>
+              )}
             </select>
+            {!servicesLoading && serviceList.length === 0 && (
+              servicesError ? (
+                <Alert className="mt-2">
+                  Xizmatlar ro'yxatini yuklab bo'lmadi: {servicesError}.{' '}
+                  <button type="button" onClick={reloadServices} className="font-semibold underline">Qayta urinish</button>
+                </Alert>
+              ) : (
+                <p className="mt-2 text-xs text-white/40">
+                  Hozircha faol xizmat yo'q. Xizmatlar sahifasidan xizmat qo'shing.
+                </p>
+              )
+            )}
           </div>
           <div>
             <label className="label">Ish boshlanish sanasi</label>

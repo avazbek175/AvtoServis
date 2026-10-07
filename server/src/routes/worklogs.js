@@ -11,13 +11,13 @@ const router = require('../asyncRoute').wrapRouter(express.Router());
 router.use(auth.authenticate);
 
 const WORK_DIR = require('../paths').workDir;
-// The service catalogue offered when filing work. Mirrors `services.name` and the
-// client's SERVICE_NAMES in client/src/serviceCatalog.js; the pair is asserted by
-// the P20 test groups. "Mator xodovoy" used to be a single combined option -- it is
-// now two services, because an engine job and a chassis job are not the same work.
-const SERVICE_TYPES = ['Mator', 'Xodovoy', 'Diagnostika', 'Programma', 'Elektrik', 'Moy almashtirish'];
-// Kept only so work logs filed under the old combined label can still be read and
-// edited. Never accepted as a new value.
+// The catalogue offered when filing work is the `services` table itself -- the
+// same rows /admin/services edits -- so a service the admin adds there is
+// fileable here immediately, and one the admin retires stops being offered. It
+// is read on demand and never mirrored into a constant: a static list would
+// quietly reject the shop's own ninth service.
+// "Mator xodovoy" used to be a single combined option -- it is now two services,
+// because an engine job and a chassis job are not the same work.
 const LEGACY_SERVICE_TYPE = 'Mator xodovoy';
 const STATUSES = ['Jarayonda', 'Tugallangan'];
 const MAX_WORK_IMAGES = 15;
@@ -190,12 +190,62 @@ const workUpload = multer({
 });
 
 /**
+ * The whole catalogue, active or not, in the order the shop offers it.
+ *
+ * Inactive rows are read as well as active ones so the refusal can name the
+ * service that exists but is switched off, instead of a flat "not a valid
+ * service type" that sends the operator hunting for a typo they did not make.
+ * Never cached: the admin panel is the source of truth, and a stale copy would
+ * keep accepting a service the shop has retired.
+ */
+async function serviceTypeCatalog() {
+  const rows = await db
+    .prepare('SELECT name, is_active FROM services ORDER BY sort_order ASC, id ASC')
+    .all();
+  return rows.map((row) => ({ name: String(row.name), active: Number(row.is_active) === 1 }));
+}
+
+/**
+ * Resolves what the operator sent to the catalogue row it stands for.
+ *
+ * The dropdown sends the stored spelling verbatim, so the exact match is the
+ * normal path. The case- and space-insensitive pass after it exists for a value
+ * typed or pasted by hand: "mator" must not be refused while the shop plainly
+ * offers "Mator". Whichever row wins, its own spelling is what comes back, so
+ * `work_logs.service_type` and `services.name` stay byte-identical and a later
+ * rename of the service cannot silently fork the two.
+ *
+ * @returns {{ name: string }} an active service, ready to store
+ *   | { inactive: string } the service exists but is switched off
+ *   | { unknown: true } nothing in the catalogue matches (or two rows match
+ *     differently, which would make picking one arbitrary)
+ */
+function resolveServiceType(catalog, raw) {
+  const wanted = String(raw == null ? '' : raw).trim();
+  if (!wanted) return { unknown: true };
+  const norm = (v) => v.replace(/\s+/g, ' ').toLowerCase();
+  const wantedNorm = norm(wanted);
+  const matches = catalog.filter((s) => s.name === wanted || norm(s.name) === wantedNorm);
+  // An active row always wins over a retired one with the same name, so a
+  // duplicate left behind by the admin cannot hide a service that is live.
+  const live = [...new Set(matches.filter((s) => s.active).map((s) => s.name))];
+  if (live.length === 1) return { name: live[0] };
+  if (live.length > 1) return { unknown: true };
+  const retired = [...new Set(matches.map((s) => s.name))];
+  return retired.length === 1 ? { inactive: retired[0] } : { unknown: true };
+}
+
+/**
  * @param {object} b request body
  * @param {string} [previousServiceType] value already stored on the row, for the
  *   PUT path. It lets a log filed under a since-retired service keep being edited
  *   without being reclassified; it never lets a NEW value through.
+ * @param {{ name: string, active: boolean }[]} catalog as returned by
+ *   serviceTypeCatalog(); loaded once per request by the caller rather than
+ *   inside the pure check, so this function stays testable on its own
+ * @returns the cleaned body, or `{ error }`
  */
-function validateWorkBody(b, previousServiceType) {
+function validateWorkBody(b, previousServiceType, catalog) {
   const service_type = String(b.service_type || '').trim();
   const status = String(b.status || 'Jarayonda').trim();
   const price = Number(b.price === '' || b.price === null || b.price === undefined ? 0 : b.price);
@@ -205,15 +255,23 @@ function validateWorkBody(b, previousServiceType) {
   // An unchanged service_type is always accepted -- including the retired
   // "Mator xodovoy" -- so editing the price or status of an old log does not force
   // the master to re-classify work they did not touch. Anything that does change
-  // has to be a service offered today, which is what stops the retired combined
-  // name from being written again.
-  if (service_type !== previousServiceType && !SERVICE_TYPES.includes(service_type)) {
-    return {
-      error:
-        service_type === LEGACY_SERVICE_TYPE
-          ? `Xizmat turi noto'g'ri: "${LEGACY_SERVICE_TYPE}" endi Mator va Xodovoy deb ikkiga ajratildi`
-          : "Xizmat turi noto'g'ri",
-    };
+  // has to be a service the shop offers today, which is what stops a retired name
+  // from being written again. The stored value is the catalogue's own spelling.
+  let canonicalType = service_type;
+  if (service_type !== previousServiceType) {
+    const resolved = resolveServiceType(catalog, service_type);
+    if (resolved.name) {
+      canonicalType = resolved.name;
+    } else if (service_type === LEGACY_SERVICE_TYPE) {
+      return {
+        error:
+          `Xizmat turi noto'g'ri: "${LEGACY_SERVICE_TYPE}" endi Mator va Xodovoy deb ikkiga ajratildi`,
+      };
+    } else if (resolved.inactive) {
+      return { error: `Xizmat turi faol emas: "${resolved.inactive}"` };
+    } else {
+      return { error: "Xizmat turi noto'g'ri" };
+    }
   }
   if (!STATUSES.includes(status)) return { error: 'Ish holati noto\'g\'ri' };
   if (!Number.isFinite(price) || price < 0 || price > 1e12) return { error: 'Narx noto\'g\'ri' };
@@ -225,7 +283,7 @@ function validateWorkBody(b, previousServiceType) {
     car_brand: clean(b.car_brand, 80),
     car_model: clean(b.car_model, 80),
     car_number: clean(b.car_number, 30),
-    service_type,
+    service_type: canonicalType,
     description: clean(b.description, 5000),
     start_date: clean(b.start_date, 20),
     end_date: clean(b.end_date, 20),
@@ -318,7 +376,7 @@ router.post('/', async (req, res) => {
   } else {
     masterId = req.user.id;
   }
-  const v = validateWorkBody(req.body || {});
+  const v = validateWorkBody(req.body || {}, undefined, await serviceTypeCatalog());
   if (v.error) return res.status(400).json({ error: v.error });
   // Shape-only validation. Sufficiency is checked under the row lock below, in
   // the same transaction as the insert.
@@ -356,6 +414,21 @@ router.post('/', async (req, res) => {
   res.status(201).json({ work: decorated });
 });
 
+/**
+ * The catalogue behind every "Xizmat turi" select.
+ *
+ * Active rows only, in catalogue order, so what the operator picks is what the
+ * shop offers today and in the arrangement made on /admin/services. Declared
+ * before `GET /:id` on purpose: a router matches in order, and `/services` would
+ * otherwise be read as a work-log id and answer 404.
+ */
+router.get('/services', async (req, res) => {
+  const services = await db
+    .prepare('SELECT id, name, icon, sort_order FROM services WHERE is_active = 1 ORDER BY sort_order ASC, id ASC')
+    .all();
+  res.json({ services });
+});
+
 router.get('/:id', async (req, res) => {
   const work = await loadWork(req.params.id);
   if (!work) return res.status(404).json({ error: 'Ish topilmadi' });
@@ -374,7 +447,7 @@ router.put('/:id', async (req, res) => {
   if ('is_public' in b && !isSA(req.user) && toFlag(b.is_public) !== currentPublic) {
     return res.status(403).json({ error: 'Faqat super admin saytda ko\'rsatishni sozlashi mumkin' });
   }
-  const v = validateWorkBody(b, work.service_type);
+  const v = validateWorkBody(b, work.service_type, await serviceTypeCatalog());
   if (v.error) return res.status(400).json({ error: v.error });
   const isPublic = 'is_public' in b ? toFlag(b.is_public) : currentPublic;
   // Must be awaited: the response body is re-read from the database right after,

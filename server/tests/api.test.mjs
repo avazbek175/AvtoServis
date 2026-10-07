@@ -4219,6 +4219,364 @@ async function readinessTests() {
   check(p21Csv.charCodeAt(0) === 0xfeff, 'P21.20 the export still carries the UTF-8 BOM Excel needs');
   check(!/(DATABASE_URL|password|secret|Bearer\s)/i.test(p21Csv),
     'P21.20 no secret reaches the export');
+
+  // =========================================================================
+  // P22. Service types come from the catalogue, not from a constant
+  // =========================================================================
+  // /admin/services is the single source for every "Xizmat turi" select. What
+  // the admin adds, renames, retires or reorders there is what the work-log form
+  // offers a moment later. `service_type` is plain TEXT on the work log, so the
+  // menu can change freely while the history already filed keeps the name it was
+  // filed under.
+  const p22 = newClient();
+  r = await p22.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+  check(r.status === 200, 'P22.0 the super admin signs in for the catalogue tests', `status=${r.status}`);
+  const p22m = newClient();
+  r = await p22m.post('/api/auth/login', { username: 'usta1', password: 'password123' });
+  check(r.status === 200, 'P22.0 and so does a master', `status=${r.status}`);
+  const p22anon = newClient();
+
+  // Snapshot taken before anything here touches the catalogue, so the group can
+  // hand it back exactly as it found it.
+  const p22Before = (await p22.get('/api/admin/services')).data.services;
+  check(Array.isArray(p22Before) && p22Before.length >= 6,
+    'P22.0 the starting catalogue can be read', JSON.stringify(p22Before && p22Before.map((s) => s.name)));
+
+  const p22db = legacyClient(PG_DB);
+  await p22db.connect();
+
+  group('P22.1 A service added on /admin/services becomes a work-log service');
+  r = await p22.post('/api/admin/services', { name: 'Mator Ochish', description: 'P22 kapital' });
+  const p22Eng = r.data && r.data.service;
+  check(r.status === 201 && !!p22Eng,
+    'P22.1 the admin can add a service', `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p22.post('/api/admin/services', { name: 'XADAVOY', description: 'P22' });
+  const p22Xadavoy = r.data && r.data.service;
+  check(r.status === 201 && !!p22Xadavoy, 'P22.1 and a second one', `status=${r.status}`);
+  try {
+    const row = await p22db.query(
+      'SELECT name, is_active, sort_order FROM services WHERE id = $1', [p22Eng.id]);
+    check(row.rows.length === 1 && row.rows[0].name === 'Mator Ochish'
+      && Number(row.rows[0].is_active) === 1,
+      'P22.1 it lands in PostgreSQL as an ordinary active row', JSON.stringify(row.rows));
+    const maxSort = await p22db.query(
+      'SELECT COALESCE(MAX(sort_order), 0)::int AS m FROM services WHERE NOT (id = ANY($1::int[]))',
+      [[p22Eng.id, p22Xadavoy.id]]);
+    check(Number(row.rows[0].sort_order) > Number(maxSort.rows[0].m),
+      'P22.1 appended after the highest sort order the catalogue already had',
+      JSON.stringify({ mine: row.rows[0].sort_order, maxBefore: maxSort.rows[0].m }));
+  } catch (e) { check(false, 'P22.1 the row can be read straight from the driver', String(e && e.message)); }
+
+  group('P22.2 The work-log select is the admin list, filtered to active');
+  r = await p22.get('/api/admin/worklogs/services');
+  const p22Live = (r.data && r.data.services || []).map((s) => s.name);
+  check(r.status === 200 && Array.isArray(r.data.services),
+    'P22.2 the catalogue endpoint answers', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(p22Live.includes('Mator Ochish') && p22Live.includes('XADAVOY'),
+    'P22.2 both services the admin just added are offered', JSON.stringify(p22Live));
+  check(!p22Live.includes('Mator xodovoy'),
+    'P22.2 and the retired combined label is not', JSON.stringify(p22Live));
+  const p22AdminActive = (await p22.get('/api/admin/services')).data.services
+    .filter((s) => Number(s.is_active) === 1).map((s) => s.name);
+  check(JSON.stringify(p22Live) === JSON.stringify(p22AdminActive),
+    'P22.2 in the very order /admin/services lists them',
+    JSON.stringify({ live: p22Live, admin: p22AdminActive }));
+  const p22First = (r.data.services || [])[0];
+  check(!!p22First && typeof p22First.id === 'number' && !!p22First.name && 'sort_order' in p22First,
+    'P22.2 each entry carries the id and name the forms need', JSON.stringify(p22First));
+
+  group('P22.3 Work is filed under the new service');
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 Mator Ochish ishi', service_type: 'Mator Ochish',
+    status: 'Jarayonda', price: 150000,
+  });
+  const p22Wl = r.data && r.data.work;
+  check(r.status === 201 && !!p22Wl && p22Wl.service_type === 'Mator Ochish',
+    'P22.3 a super admin files a job under it', `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p22m.post('/api/admin/worklogs', {
+    title: 'P22 xadavoy ishi', service_type: '  xadavoy  ', status: 'Jarayonda', price: 1000,
+  });
+  const p22CaseWl = r.data && r.data.work;
+  check(r.status === 201 && !!p22CaseWl && p22CaseWl.service_type === 'XADAVOY',
+    'P22.3 a master files one too, and stray spaces and casing resolve to the catalogue spelling',
+    `status=${r.status} ${JSON.stringify(r.data && r.data.work && r.data.work.service_type)}`);
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 yoq', service_type: "Balans va rul",
+    status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 400, 'P22.3 a service the shop does not offer is still refused',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  group('P22.4 Renaming a service changes the menu and nothing else');
+  r = await p22.put('/api/admin/services/' + p22Xadavoy.id, { name: 'Moshina ochish' });
+  check(r.status === 200 && r.data.service.name === 'Moshina ochish',
+    'P22.4 the admin renames it', `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p22.get('/api/admin/worklogs/services');
+  const p22AfterRename = (r.data.services || []).map((s) => s.name);
+  check(p22AfterRename.includes('Moshina ochish') && !p22AfterRename.includes('XADAVOY'),
+    'P22.4 the select shows the new name and drops the old one', JSON.stringify(p22AfterRename));
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 yangi nom bilan', service_type: 'Moshina ochish',
+    status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 201, 'P22.4 work files under the new name', `status=${r.status}`);
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 eski nom bilan', service_type: 'XADAVOY',
+    status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 400, 'P22.4 and the name it replaced is refused',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  group('P22.5 Retiring a service takes it off the menu');
+  r = await p22.put('/api/admin/services/' + p22Eng.id, { is_active: false });
+  check(r.status === 200 && Number(r.data.service.is_active) === 0,
+    'P22.5 the admin switches it off', `status=${r.status}`);
+  r = await p22.get('/api/admin/worklogs/services');
+  const p22AfterRetire = (r.data.services || []).map((s) => s.name);
+  check(!p22AfterRetire.includes('Mator Ochish') && p22AfterRetire.includes('Mator'),
+    'P22.5 it is gone from the select while the rest are untouched',
+    JSON.stringify(p22AfterRetire));
+
+  group('P22.6 A retired service cannot take new work, but old work still edits');
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 faolsiz xizmat', service_type: 'Mator Ochish',
+    status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 400 && /faol emas/.test((r.data && r.data.error) || ''),
+    'P22.6 the server names the problem instead of a flat "not a valid type"',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p22.put('/api/admin/worklogs/' + p22Wl.id, {
+    title: 'P22 Mator Ochish ishi (tahrir)', service_type: 'Mator Ochish',
+    status: 'Jarayonda', price: 175000,
+  });
+  check(r.status === 200 && r.data.work.service_type === 'Mator Ochish'
+    && r.data.work.title === 'P22 Mator Ochish ishi (tahrir)',
+    'P22.6 the log already filed under it is edited without being re-classified',
+    `status=${r.status} ${JSON.stringify(r.data && r.data.work && r.data.work.service_type)}`);
+
+  group('P22.7 Re-activating a service puts it straight back');
+  r = await p22.put('/api/admin/services/' + p22Eng.id, { is_active: true });
+  check(r.status === 200 && Number(r.data.service.is_active) === 1,
+    'P22.7 the admin switches it back on', `status=${r.status}`);
+  r = await p22.get('/api/admin/worklogs/services');
+  check((r.data.services || []).map((s) => s.name).includes('Mator Ochish'),
+    'P22.7 it is offered again', JSON.stringify((r.data.services || []).map((s) => s.name)));
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 qayta faol', service_type: 'Mator Ochish',
+    status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 201, 'P22.7 and takes new work again', `status=${r.status}`);
+
+  group('P22.8 Reordering the catalogue reorders the select');
+  r = await p22.get('/api/admin/worklogs/services');
+  const p22OrderBefore = (r.data.services || []).map((s) => s.name);
+  const p22IdsBefore = (await p22.get('/api/admin/services')).data.services.map((s) => s.id);
+  const p22NewIds = [p22Eng.id, p22Xadavoy.id];
+  r = await p22.patch('/api/admin/services/reorder', {
+    ids: [...p22NewIds, ...p22IdsBefore.filter((id) => !p22NewIds.includes(id))],
+  });
+  check(r.status === 200, 'P22.8 the admin moves the two new ones to the front', `status=${r.status}`);
+  r = await p22.get('/api/admin/worklogs/services');
+  const p22OrderAfter = (r.data.services || []).map((s) => s.name);
+  check(p22OrderAfter[0] === 'Mator Ochish' && p22OrderAfter[1] === 'Moshina ochish',
+    'P22.8 the select follows the order the admin arranged', JSON.stringify(p22OrderAfter));
+  r = await p22.patch('/api/admin/services/reorder', { ids: p22IdsBefore });
+  check(r.status === 200, 'P22.8 the order is put back', `status=${r.status}`);
+  r = await p22.get('/api/admin/worklogs/services');
+  check(JSON.stringify((r.data.services || []).map((s) => s.name)) === JSON.stringify(p22OrderBefore),
+    'P22.8 and comes back exactly as it was', JSON.stringify((r.data.services || []).map((s) => s.name)));
+
+  group('P22.9 A rename never rewrites the history already filed');
+  r = await p22.get('/api/admin/worklogs/' + p22Wl.id);
+  check(r.status === 200 && r.data.work.service_type === 'Mator Ochish',
+    'P22.9 the log still says what it was filed under',
+    `status=${r.status} ${JSON.stringify(r.data && r.data.work && r.data.work.service_type)}`);
+  r = await p22.put('/api/admin/services/' + p22Eng.id, { name: 'Mator ochish (kapital)' });
+  check(r.status === 200 && r.data.service.name === 'Mator ochish (kapital)',
+    'P22.9 the service behind it is renamed', `status=${r.status}`);
+  r = await p22.get('/api/admin/worklogs/' + p22Wl.id);
+  check(r.status === 200 && r.data.work.service_type === 'Mator Ochish',
+    'P22.9 and the work log keeps the name it was filed under',
+    JSON.stringify(r.data && r.data.work && r.data.work.service_type));
+  try {
+    const stored = await p22db.query('SELECT service_type FROM work_logs WHERE id = $1', [p22Wl.id]);
+    check(stored.rows[0].service_type === 'Mator Ochish',
+      'P22.9 stored by value in PostgreSQL, not by a key that could dangle',
+      JSON.stringify(stored.rows[0]));
+  } catch (e) { check(false, 'P22.9 the stored value can be read', String(e && e.message)); }
+
+  group('P22.10 Editing keeps a value the catalogue no longer offers');
+  r = await p22.put('/api/admin/worklogs/' + p22Wl.id, {
+    title: 'P22 Mator Ochish ishi (yakuniy)', service_type: 'Mator Ochish',
+    status: 'Tugallangan', price: 180000,
+  });
+  check(r.status === 200 && r.data.work.service_type === 'Mator Ochish'
+    && r.data.work.status === 'Tugallangan',
+    'P22.10 an edit may leave a renamed-away service untouched',
+    `status=${r.status} ${JSON.stringify(r.data && r.data.work && r.data.work.service_type)}`);
+  r = await p22.put('/api/admin/worklogs/' + p22CaseWl.id, {
+    title: 'P22 xadavoy ishi (yangisi)', service_type: 'Moshina ochish',
+    status: 'Jarayonda', price: 2000,
+  });
+  check(r.status === 200 && r.data.work.service_type === 'Moshina ochish',
+    'P22.10 and it can still be moved onto a service the shop offers today',
+    `status=${r.status} ${JSON.stringify(r.data && r.data.work && r.data.work.service_type)}`);
+  r = await p22.put('/api/admin/worklogs/' + p22CaseWl.id, {
+    title: 'P22 yana eski', service_type: 'XADAVOY', status: 'Jarayonda', price: 2000,
+  });
+  check(r.status === 400, 'P22.10 but the replaced name cannot be written back',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  group('P22.11 The screen loads the list instead of importing a constant');
+  r = await p22anon.get('/api/admin/worklogs/services');
+  check(r.status === 401, 'P22.11 an anonymous visitor gets 401 rather than the list',
+    `status=${r.status}`);
+  r = await p22anon.post('/api/admin/worklogs', { title: 'x', service_type: 'Mator' });
+  check(r.status === 401 || r.status === 403,
+    'P22.11 and still cannot file work', `status=${r.status}`);
+  const p22Src = path.join(srcRoot, 'pages', 'admin', 'WorkLogs.jsx');
+  const p22FormSrc = fs.readFileSync(p22Src, 'utf8');
+  check(p22FormSrc.includes('useServiceTypes'),
+    'P22.11 the work-log form reads its options from the API');
+  check(!/const\s+SERVICE_TYPES\s*=\s*\[/.test(p22FormSrc)
+    && !/SERVICE_TYPES\.map/.test(p22FormSrc),
+    'P22.11 and carries no list of its own', 'a hard-coded list is still there');
+  check(/Yuklanmoqda/.test(p22FormSrc),
+    'P22.11 it shows a loading state while the request is in flight');
+  check(/Qayta urinish/.test(p22FormSrc),
+    'P22.11 and a way out when the request fails');
+  check(/Faol xizmat yo'q/.test(p22FormSrc),
+    'P22.11 and says so when the catalogue comes back empty');
+  const p22TypesSrc = fs.readFileSync(path.join(srcRoot, 'serviceTypes.js'), 'utf8');
+  check(p22TypesSrc.includes('inflight'),
+    'P22.11 repeat requests are collapsed into one round trip');
+  check(p22TypesSrc.includes('fresh'),
+    'P22.11 and the modal can force a refresh every time it opens');
+
+  group('P22.12 An empty catalogue is an empty select, not a crash');
+  const p22ActiveIds = (await p22.get('/api/admin/services')).data.services
+    .filter((s) => Number(s.is_active) === 1).map((s) => s.id);
+  check(p22ActiveIds.length > 0, 'P22.12 there is a catalogue to empty', `n=${p22ActiveIds.length}`);
+  for (const id of p22ActiveIds) await p22.put('/api/admin/services/' + id, { is_active: false });
+  r = await p22.get('/api/admin/worklogs/services');
+  check(r.status === 200 && Array.isArray(r.data.services) && r.data.services.length === 0,
+    'P22.12 the endpoint answers with an empty list', JSON.stringify(r.data));
+  r = await p22.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P22 menusiz', service_type: 'Mator',
+    status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 400 && /faol emas/.test((r.data && r.data.error) || ''),
+    'P22.12 and nothing is accepted while every service is switched off',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  for (const id of p22ActiveIds) await p22.put('/api/admin/services/' + id, { is_active: true });
+  r = await p22.get('/api/admin/worklogs/services');
+  check((r.data.services || []).length === p22ActiveIds.length,
+    'P22.12 switching them all back restores the whole menu',
+    `n=${(r.data.services || []).length} expected=${p22ActiveIds.length}`);
+
+  group('P22.13 The debt ledger reads the same catalogue');
+  const p22Debt = await p22.post('/api/admin/debts', {
+    full_name: 'P22 Qarzdor', phone: '+9989011110006', service: 'Moshina ochish',
+    debt_amount: 50000, paid_amount: 0,
+  });
+  check(p22Debt.status === 201,
+    'P22.13 a debt can be recorded under the newly added service', `status=${p22Debt.status}`);
+  const p22DebtId = p22Debt.data && p22Debt.data.debt.id;
+  if (p22DebtId) {
+    r = await p22.patch(`/api/admin/debts/${p22DebtId}`, { service: 'Elektrik' });
+    check(r.status === 200 && r.data.debt.service === 'Elektrik',
+      'P22.13 an edit still picks from the live catalogue',
+      `status=${r.status} ${JSON.stringify(r.data)}`);
+    r = await p22.patch(`/api/admin/debts/${p22DebtId}`, { service: 'XADAVOY' });
+    check(r.status === 400, 'P22.13 a name the shop retired is still refused', `status=${r.status}`);
+  }
+  r = await p22.get('/api/admin/debts?q=' + encodeURIComponent('P22 Qarzdor'));
+  check(r.status === 200 && (r.data.debts || []).length === 1,
+    'P22.13 and the ledger list is unaffected', `status=${r.status} n=${r.data && r.data.debts && r.data.debts.length}`);
+
+  group('P22.14 The warehouse is untouched by all of this');
+  r = await p22.get('/api/admin/inventory/products?per_page=5');
+  check(r.status === 200 && Array.isArray(r.data.products),
+    'P22.14 the product list still answers', `status=${r.status}`);
+  r = await p22.get('/api/admin/inventory/stats');
+  check(r.status === 200 && !!r.data.stats, 'P22.14 and so do the totals', `status=${r.status}`);
+  r = await p22.get('/api/admin/inventory/movements');
+  check(r.status === 200 && Array.isArray(r.data.movements) && r.data.movements.length > 0,
+    'P22.14 the movement ledger still has every row', `status=${r.status} n=${r.data && r.data.movements && r.data.movements.length}`);
+  try {
+    const moves = await p22db.query('SELECT COUNT(*)::int AS n FROM inventory_movements');
+    check(moves.rows[0].n > 0, 'P22.14 nothing was deleted from it', JSON.stringify(moves.rows[0]));
+    const prods = await p22db.query('SELECT COUNT(*)::int AS n FROM inventory_products');
+    check(prods.rows[0].n > 0, 'P22.14 and no product was removed', JSON.stringify(prods.rows[0]));
+  } catch (e) { check(false, 'P22.14 the warehouse tables can be read', String(e && e.message)); }
+
+  group('P22.15 The catalogue endpoint follows the usual authorisation rules');
+  r = await p22m.get('/api/admin/worklogs/services');
+  check(r.status === 200, 'P22.15 a master may read the list they file work from',
+    `status=${r.status}`);
+  r = await p22m.post('/api/admin/worklogs', {
+    title: 'P22 usta ishi', service_type: 'Moshina ochish', status: 'Jarayonda', price: 1000,
+  });
+  check(r.status === 201,
+    'P22.15 and may file work under a service the admin just added',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p22m.post('/api/admin/services', { name: 'Master qoshgan' });
+  check(r.status === 201 || r.status === 403,
+    'P22.15 the services permission itself is unchanged', `status=${r.status}`);
+  if (r.status === 201) await p22.del('/api/admin/services/' + r.data.service.id);
+
+  group('P22.16 The catalogue lives in PostgreSQL, as text, with no key to break');
+  try {
+    const col = await p22db.query(
+      `SELECT data_type FROM information_schema.columns
+        WHERE table_name = 'work_logs' AND column_name = 'service_type'`);
+    check(col.rows[0] && col.rows[0].data_type === 'text',
+      'P22.16 service_type is still plain TEXT', JSON.stringify(col.rows));
+    const catNow = await p22db.query(
+      'SELECT name FROM services WHERE is_active = 1 ORDER BY sort_order, id');
+    const namesNow = catNow.rows.map((s) => s.name);
+    const filed = await p22db.query('SELECT service_type FROM work_logs WHERE id = $1', [p22Wl.id]);
+    check(!namesNow.includes(filed.rows[0].service_type),
+      'P22.16 so a work log keeps a name the live catalogue no longer has, without a dangling reference',
+      JSON.stringify({ filed: filed.rows[0].service_type, live: namesNow }));
+    const fk = await p22db.query(
+      `SELECT COUNT(*)::int AS n
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage k
+           ON k.constraint_name = tc.constraint_name AND k.table_schema = tc.table_schema
+        WHERE tc.table_name = 'work_logs' AND tc.constraint_type = 'FOREIGN KEY'
+          AND k.column_name = 'service_type'`);
+    check(fk.rows[0].n === 0,
+      'P22.16 service_type carries no foreign key, so a deleted service cannot orphan a log',
+      JSON.stringify(fk.rows[0]));
+  } catch (e) { check(false, 'P22.16 the schema can be inspected', String(e && e.message)); }
+
+  group('P22.17 The catalogue is handed back exactly as it was found');
+  const p22Now = (await p22.get('/api/admin/services')).data.services;
+  for (const s of p22Now) {
+    if (!p22Before.some((b) => b.id === s.id)) await p22.del('/api/admin/services/' + s.id);
+  }
+  const p22Kept = (await p22.get('/api/admin/services')).data.services;
+  for (const s of p22Kept) {
+    const before = p22Before.find((b) => b.id === s.id);
+    if (!before) continue;
+    if (before.name !== s.name) await p22.put('/api/admin/services/' + s.id, { name: before.name });
+    if (Number(before.is_active) !== Number(s.is_active)) {
+      await p22.put('/api/admin/services/' + s.id, { is_active: Number(before.is_active) === 1 });
+    }
+  }
+  r = await p22.patch('/api/admin/services/reorder', { ids: p22Before.map((s) => s.id) });
+  check(r.status === 200, 'P22.17 the original order is restored', `status=${r.status}`);
+  const p22Final = (await p22.get('/api/admin/services')).data.services;
+  const sig = (list) => JSON.stringify(list.map((s) => [s.name, Number(s.is_active)]));
+  check(sig(p22Final) === sig(p22Before),
+    'P22.17 name, state and order are the ones we started with',
+    JSON.stringify({ before: p22Before.map((s) => [s.name, s.is_active]), final: p22Final.map((s) => [s.name, s.is_active]) }));
+  const p22Restored = (await p22.get('/api/admin/worklogs/services')).data.services.map((s) => s.name);
+  check(JSON.stringify(p22Restored) === JSON.stringify(p22Before.filter((s) => Number(s.is_active) === 1).map((s) => s.name)),
+    'P22.17 and the work-log select is back to the baseline six',
+    JSON.stringify(p22Restored));
+  await p22db.end();
 }
 
 try {
