@@ -19,9 +19,17 @@ const { db: pool } = db;
 
 // Columns returned for a product row. Kept in one place so the list endpoint,
 // the detail endpoint and the CSV export can never drift apart.
+//
+// `sale_price` is an output expression, not a column: `cost_price +
+// markup_amount` is computed by PostgreSQL at read time, so the selling price
+// can never fall out of step with the two numbers it is made of. Every call site
+// selects from this single table (no join, no aggregate), which is what makes a
+// bare expression safe here.
 const PRODUCT_FIELDS =
   'id, name, type, brand, viscosity, unit, package_size, current_quantity, ' +
-  'minimum_quantity, cost_price, is_active, created_at, updated_at';
+  'minimum_quantity, cost_price, markup_amount, ' +
+  'cost_price + markup_amount AS sale_price, ' +
+  'is_active, created_at, updated_at';
 
 const MOVEMENT_FIELDS =
   'id, product_id, movement_type, quantity, before_quantity, after_quantity, ' +
@@ -211,6 +219,7 @@ function validateProduct(input) {
     { allowZero: true }
   );
   out.cost_price = parseMoney(input.cost_price, 'Kelish narxi');
+  out.markup_amount = parseMoney(input.markup_amount, 'Ustama summa');
 
   return out;
 }
@@ -260,6 +269,7 @@ function snapshot(p) {
     current_quantity: Number(p.current_quantity),
     minimum_quantity: Number(p.minimum_quantity),
     cost_price: Number(p.cost_price),
+    markup_amount: Number(p.markup_amount),
     is_active: Number(p.is_active),
   };
 }
@@ -530,8 +540,8 @@ async function createProduct(runner, req, input, opts = {}) {
     .prepare(
       `INSERT INTO inventory_products
          (name, type, brand, viscosity, unit, package_size, current_quantity,
-          minimum_quantity, cost_price, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          minimum_quantity, cost_price, markup_amount, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
        RETURNING ${PRODUCT_FIELDS}`
     )
     .one(
@@ -543,7 +553,8 @@ async function createProduct(runner, req, input, opts = {}) {
       clean.package_size,
       0,
       clean.minimum_quantity,
-      clean.cost_price
+      clean.cost_price,
+      clean.markup_amount
     );
 
   let openingMovementId = null;

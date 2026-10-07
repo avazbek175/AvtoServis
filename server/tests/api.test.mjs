@@ -3304,16 +3304,24 @@ async function readinessTests() {
   check(firstInvalidIndex(errs) === 0, 'P18.15 the first bad card is the one to jump to', `${firstInvalidIndex(errs)}`);
   check(firstInvalidIndex([{}, {}, {}]) === -1, 'P18.15 a clean batch has nothing to jump to');
 
-  // The field rules. Only what the card can actually hold is checked any more:
-  // minimal quantity, cost price and opening stock left the form, so the client
-  // validator has no opinion about them -- a stale card carrying them is simply
-  // ignored rather than refused.
+  // The field rules. Everything the card can actually hold is checked: the two
+  // prices came back with the form, so they are validated with the same strictness
+  // the server applies. `minimum_quantity` and `initial_quantity` are still absent,
+  // so a stale card carrying them is simply ignored rather than refused.
   const qtyCases = [
     [{ package_size: '0' }, 'oil', true, 'a zero package size is refused'],
     [{ package_size: '4.5.6' }, 'oil', true, 'a malformed package size is refused'],
     [{ package_size: '4' }, 'oil', false, 'a package size is still collected and checked'],
+    [{ cost_price: '45000' }, 'oil', false, 'a plain price is accepted'],
+    [{ cost_price: '45000.50' }, 'oil', false, 'a price with two decimals is accepted'],
+    [{ cost_price: '-5' }, 'oil', true, 'a negative price is refused'],
+    [{ cost_price: '45000abc' }, 'oil', true, 'a partially numeric price is refused'],
+    [{ cost_price: '45000.123' }, 'oil', true, 'a price past two decimals is refused'],
+    [{ markup_amount: '10000' }, 'oil', false, 'a plain markup is accepted'],
+    [{ markup_amount: '-1' }, 'oil', true, 'a negative markup is refused'],
+    [{ markup_amount: 'NaN' }, 'oil', true, 'a non-numeric markup is refused'],
+    [{ markup_amount: '1e5' }, 'oil', true, 'an exponent in a markup is refused'],
     [{ initial_quantity: '1.5' }, 'filter', false, 'an opening stock is no longer collected, so nothing to refuse'],
-    [{ cost_price: '-5' }, 'oil', false, 'a price is no longer collected, so nothing to refuse'],
     [{ minimum_quantity: 'abc' }, 'oil', false, 'a minimum is no longer collected, so nothing to refuse'],
   ];
   for (const [fields, type, expectError, label] of qtyCases) {
@@ -3340,21 +3348,24 @@ async function readinessTests() {
     'P18.15 clearing on a card with no errors yet is harmless');
 
   group('P18.16 The payload the form builds');
-  // A blank card carries only what the form can ask for. The three retired fields
+  // A blank card carries only what the form can ask for. The two retired fields
   // are not even present as empty keys, so they can never reach the request.
-  check(JSON.stringify(Object.keys(emptyDraft()).sort()) === JSON.stringify(['brand', 'name', 'package_size', 'type', 'viscosity']),
+  check(JSON.stringify(Object.keys(emptyDraft()).sort())
+      === JSON.stringify(['brand', 'cost_price', 'markup_amount', 'name', 'package_size', 'type', 'viscosity']),
     'P18.16 a blank card holds only the fields the form shows', JSON.stringify(Object.keys(emptyDraft()).sort()));
-  const oilPayload = draftPayload({ name: '  Castrol EDGE  ', type: 'oil', brand: ' Castrol ', viscosity: ' 5W-30 ', package_size: '4', minimum_quantity: '20', cost_price: '45000', initial_quantity: '100' });
-  check(JSON.stringify(oilPayload) === JSON.stringify({ name: 'Castrol EDGE', type: 'oil', brand: 'Castrol', unit: 'liter', viscosity: '5W-30', package_size: '4' }),
+  const oilPayload = draftPayload({ name: '  Castrol EDGE  ', type: 'oil', brand: ' Castrol ', viscosity: ' 5W-30 ', package_size: '4', cost_price: ' 45000 ', markup_amount: ' 10000 ', minimum_quantity: '20', initial_quantity: '100' });
+  check(JSON.stringify(oilPayload) === JSON.stringify({ name: 'Castrol EDGE', type: 'oil', brand: 'Castrol', unit: 'liter', viscosity: '5W-30', package_size: '4', cost_price: '45000', markup_amount: '10000' }),
     'P18.16 a filled oil card produces the spec\'s payload, trimmed', JSON.stringify(oilPayload));
-  check(!('minimum_quantity' in oilPayload) && !('cost_price' in oilPayload) && !('initial_quantity' in oilPayload),
-    'P18.16 the three retired fields are never sent, whatever the card carries', JSON.stringify(oilPayload));
-  const filterPayload = draftPayload({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', viscosity: '', package_size: '', minimum_quantity: '5', cost_price: '35000', initial_quantity: '20' });
+  check(!('minimum_quantity' in oilPayload) && !('initial_quantity' in oilPayload),
+    'P18.16 the two retired fields are never sent, whatever the card carries', JSON.stringify(oilPayload));
+  const filterPayload = draftPayload({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', viscosity: '', package_size: '', cost_price: '35000', markup_amount: '', minimum_quantity: '5', initial_quantity: '20' });
   check(filterPayload.unit === 'piece' && filterPayload.viscosity === undefined,
     'P18.16 a filter never sends a viscosity', JSON.stringify(filterPayload));
   check(filterPayload.package_size === undefined,
     'P18.16 an untouched optional field is left out, so the server default applies', JSON.stringify(filterPayload));
-  check(JSON.stringify(filterPayload) === JSON.stringify({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', unit: 'piece' }),
+  check(filterPayload.markup_amount === undefined,
+    'P18.16 an untouched markup is left out too', JSON.stringify(filterPayload));
+  check(JSON.stringify(filterPayload) === JSON.stringify({ name: 'MANN Oil Filter', type: 'filter', brand: 'MANN', unit: 'piece', cost_price: '35000' }),
     'P18.16 a plain filter card sends exactly the fields the form shows', JSON.stringify(filterPayload));
 
   group('P18.17 A server error points back at its card');
@@ -3849,6 +3860,365 @@ async function readinessTests() {
     check(audits.rows[0].n >= 1, 'P20.19 and so did its audit trail', `n=${audits.rows[0].n}`);
   } catch (e) { check(false, 'P20.19 the split can be replayed on the live catalogue', String(e && e.message)); }
   await liveDb.end();
+
+  // =========================================================================
+  // P21. Warehouse prices: cost, markup, and the sale price that follows
+  // =========================================================================
+  // The catalogue stores two numbers -- what the shop paid (`cost_price`) and what
+  // is added on top (`markup_amount`) -- and derives the third. `sale_price` is not
+  // a column, so it cannot drift away from the two it is made of: every read
+  // computes it in PostgreSQL as NUMERIC, where 0.1 + 0.2 is still 0.3.
+  const p21 = newClient();
+  r = await p21.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+  check(r.status === 200, 'P21.0 the super admin signs in for the price tests', `status=${r.status}`);
+
+  group('P21.1 A product records what it cost');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Narxli Moy', type: 'oil', brand: 'NarxBrend', viscosity: '5W-30', cost_price: 45000,
+  });
+  const costOnly = r.data && r.data.product;
+  check(r.status === 201 && !!costOnly,
+    'P21.1 a product carrying only a cost is created', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!costOnly && Number(costOnly.cost_price) === 45000,
+    'P21.1 the cost is stored exactly as sent', JSON.stringify(costOnly && costOnly.cost_price));
+  check(!!costOnly && Number(costOnly.markup_amount) === 0,
+    'P21.1 the markup the form never mentioned falls back to 0', JSON.stringify(costOnly && costOnly.markup_amount));
+  check(!!costOnly && Number(costOnly.sale_price) === 45000,
+    'P21.1 so the sale price starts out equal to the cost', JSON.stringify(costOnly && costOnly.sale_price));
+
+  group('P21.2 A markup is stored next to the cost, not inside it');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Ustamali Moy', type: 'oil', brand: 'NarxBrend', viscosity: '0W-20',
+    cost_price: 45000, markup_amount: 10000,
+  });
+  const marked = r.data && r.data.product;
+  check(r.status === 201 && !!marked,
+    'P21.2 a cost and a markup in one request are both accepted', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!marked && Number(marked.cost_price) === 45000 && Number(marked.markup_amount) === 10000,
+    'P21.2 neither number overwrites the other', JSON.stringify(marked && [marked.cost_price, marked.markup_amount]));
+
+  group('P21.3 The sale price is the sum, on create and on read');
+  check(!!marked && Number(marked.sale_price) === 55000,
+    'P21.3 the create response already carries 45000 + 10000',
+    JSON.stringify(marked && marked.sale_price));
+  r = await p21.get(`/api/admin/inventory/products/${marked && marked.id}`);
+  check(r.status === 200 && Number(r.data.product.sale_price) === 55000,
+    'P21.3 a fresh read recomputes the same 55000 rather than trusting a copy',
+    JSON.stringify(r.data && r.data.product.sale_price));
+  check(Number(r.data.product.cost_price) === 45000 && Number(r.data.product.markup_amount) === 10000,
+    'P21.3 and the two parts come back untouched', JSON.stringify(r.data.product));
+
+  group('P21.4 A product that cost nothing still sells for its markup');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Bepul kelgan filtr', type: 'filter', brand: 'NarxBrend',
+    cost_price: 0, markup_amount: 5000,
+  });
+  const gift = r.data && r.data.product;
+  check(r.status === 201 && !!gift && Number(gift.sale_price) === 5000,
+    'P21.4 0 + 5000 is 5000', JSON.stringify(gift));
+
+  group('P21.5 A product with no markup sells at cost');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Ustamasiz moy', type: 'oil', brand: 'NarxBrend', viscosity: '5W-40',
+    cost_price: 78000, markup_amount: 0,
+  });
+  const flat = r.data && r.data.product;
+  check(r.status === 201 && !!flat && Number(flat.sale_price) === 78000,
+    'P21.5 an explicit zero markup leaves the sale price at the cost',
+    JSON.stringify(flat && flat.sale_price));
+
+  group('P21.6 A cost keeps its two decimals');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Onda ikki xonali', type: 'oil', brand: 'NarxBrend', viscosity: '0W-30',
+    cost_price: '185000.50', markup_amount: '9999.99',
+  });
+  const decimal = r.data && r.data.product;
+  check(r.status === 201 && !!decimal,
+    'P21.6 two-decimal money is accepted on both fields', `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!decimal && Number(decimal.cost_price) === 185000.5,
+    'P21.6 the cost keeps its decimals', JSON.stringify(decimal && decimal.cost_price));
+
+  group('P21.7 The sum of two decimal prices is exact');
+  check(!!decimal && Number(decimal.markup_amount) === 9999.99,
+    'P21.7 the markup keeps its decimals too', JSON.stringify(decimal && decimal.markup_amount));
+  // The sum is computed by PostgreSQL as NUMERIC(12,2), never in JavaScript --
+  // 185000.50 + 9999.99 would otherwise arrive as 195000.49000000002.
+  check(!!decimal && Number(decimal.sale_price) === 195000.49,
+    'P21.7 and 185000.50 + 9999.99 is exactly 195000.49, not a floating-point approximation',
+    JSON.stringify(decimal && decimal.sale_price));
+
+  group('P21.8 A negative cost is refused');
+  const negativeCosts = [-5, '-5', '45000.50-'];
+  for (const bad of negativeCosts) {
+    r = await p21.post('/api/admin/inventory/products', {
+      name: 'Manfiy narxli', type: 'oil', brand: 'NarxBrend', viscosity: '5W-30', cost_price: bad,
+    });
+    check(r.status === 400, `P21.8 a cost of ${JSON.stringify(bad)} is refused with a 400, not a database 500`,
+      `status=${r.status} ${JSON.stringify(r.data)}`);
+  }
+
+  group('P21.9 A negative markup is refused');
+  const negativeMarkups = [-1, '-1', '10000.999'];
+  for (const bad of negativeMarkups) {
+    r = await p21.post('/api/admin/inventory/products', {
+      name: 'Manfiy ustamali', type: 'oil', brand: 'NarxBrend', viscosity: '5W-30', markup_amount: bad,
+    });
+    check(r.status === 400, `P21.9 a markup of ${JSON.stringify(bad)} is refused with a 400 too`,
+      `status=${r.status} ${JSON.stringify(r.data)}`);
+  }
+
+  group('P21.10 A malformed or out-of-range price is refused');
+  const badPrices = [
+    [{ cost_price: '45000abc' }, 'a partially numeric cost'],
+    [{ markup_amount: '10000 000' }, 'a markup with a thousands separator'],
+    [{ cost_price: 'NaN' }, 'a cost that is not a number at all'],
+    [{ cost_price: '1e5' }, 'an exponent in a cost'],
+    [{ cost_price: '45000.123' }, 'a cost past the column\'s two decimals'],
+    [{ cost_price: 999999999999 }, 'a cost past the column width'],
+    [{ markup_amount: 999999999999 }, 'a markup past the column width'],
+  ];
+  for (const [body, label] of badPrices) {
+    r = await p21.post('/api/admin/inventory/products', {
+      name: 'Yaroqsiz narx', type: 'oil', brand: 'NarxBrend', viscosity: '5W-30', ...body,
+    });
+    check(r.status === 400, `P21.10 ${label} is refused with a 400, not a database 500`,
+      `status=${r.status} ${JSON.stringify(r.data)}`);
+  }
+  r = await p21.get('/api/admin/inventory/products?q=Yaroqsiz narx');
+  check(r.data.pagination.total === 0, 'P21.10 none of the refused prices reached the warehouse',
+    `n=${r.data.pagination.total}`);
+
+  group('P21.11 Editing the cost leaves the markup alone');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Tahrirlanadigan narx', type: 'oil', brand: 'NarxBrend', viscosity: '5W-30',
+    cost_price: 45000, markup_amount: 10000,
+  });
+  const editTarget = r.data && r.data.product;
+  check(r.status === 201 && !!editTarget, 'P21.11 a product to edit is created',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p21.patch(`/api/admin/inventory/products/${editTarget && editTarget.id}`, { cost_price: 50000 });
+  const costEdited = r.data && r.data.product;
+  check(r.status === 200 && !!costEdited, 'P21.11 a PATCH carrying only the cost is accepted',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!costEdited && Number(costEdited.cost_price) === 50000,
+    'P21.11 the cost was applied', JSON.stringify(costEdited && costEdited.cost_price));
+  check(!!costEdited && Number(costEdited.markup_amount) === 10000,
+    'P21.11 the markup it did not send is exactly what it was',
+    JSON.stringify(costEdited && costEdited.markup_amount));
+  check(!!costEdited && Number(costEdited.sale_price) === 60000,
+    'P21.11 and the sale price followed both', JSON.stringify(costEdited && costEdited.sale_price));
+
+  group('P21.12 Editing the markup leaves the cost alone');
+  r = await p21.patch(`/api/admin/inventory/products/${editTarget && editTarget.id}`, { markup_amount: 25000 });
+  const markupEdited = r.data && r.data.product;
+  check(r.status === 200 && Number(markupEdited.markup_amount) === 25000
+    && Number(markupEdited.cost_price) === 50000 && Number(markupEdited.sale_price) === 75000,
+    'P21.12 the same holds the other way round', JSON.stringify(markupEdited));
+
+  r = await p21.patch(`/api/admin/inventory/products/${editTarget && editTarget.id}`, { name: 'Faqat nomi' });
+  const renamed = r.data && r.data.product;
+  check(r.status === 200 && Number(renamed.cost_price) === 50000
+    && Number(renamed.markup_amount) === 25000 && Number(renamed.sale_price) === 75000,
+    'P21.12 an edit carrying no price at all changes no price', JSON.stringify(renamed));
+
+  r = await p21.patch(`/api/admin/inventory/products/${editTarget && editTarget.id}`, { markup_amount: -1 });
+  check(r.status === 400, 'P21.12 a negative markup on the edit path is refused too',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  const unchanged = (await p21.get(`/api/admin/inventory/products/${editTarget.id}`)).data.product;
+  check(Number(unchanged.markup_amount) === 25000 && Number(unchanged.sale_price) === 75000,
+    'P21.12 and the refused edit moved nothing', JSON.stringify(unchanged));
+
+  group('P21.13 A batch carries prices on every card');
+  r = await p21.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Paketli Moy', type: 'oil', brand: 'Paket', viscosity: '5W-30', package_size: 4,
+        cost_price: 180000, markup_amount: 20000 },
+      { name: 'Paketli Filtr', type: 'filter', brand: 'Paket', package_size: 6,
+        cost_price: 35000, markup_amount: 5000 },
+    ],
+  });
+  const pricedBatch = r.data && r.data.products;
+  check(r.status === 201 && r.data.count === 2,
+    'P21.13 a mixed batch with prices on both cards is accepted',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  check(!!pricedBatch && Number(pricedBatch[0].cost_price) === 180000
+    && Number(pricedBatch[0].markup_amount) === 20000 && Number(pricedBatch[0].sale_price) === 200000,
+    'P21.13 the oil keeps its own two numbers', JSON.stringify(pricedBatch && pricedBatch[0]));
+  check(!!pricedBatch && Number(pricedBatch[1].cost_price) === 35000
+    && Number(pricedBatch[1].markup_amount) === 5000 && Number(pricedBatch[1].sale_price) === 40000,
+    'P21.13 the filter keeps its own', JSON.stringify(pricedBatch && pricedBatch[1]));
+
+  group('P21.14 One bad price rolls the whole batch back');
+  const beforeBadBatch = (await p21.get('/api/admin/inventory/products?q=Paketli Moy')).data.pagination.total;
+  r = await p21.post('/api/admin/inventory/products/bulk', {
+    products: [
+      { name: 'Birinchi Narx', type: 'oil', brand: 'Bekor', viscosity: '5W-30', cost_price: 1000, markup_amount: 1 },
+      { name: 'Ikkinchi Narx', type: 'filter', brand: 'Bekor', markup_amount: -1 },
+    ],
+  });
+  check(r.status === 400 && /2-mahsulot/.test(r.data.error || ''),
+    'P21.14 a negative markup is blamed on the card that carried it',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  const rolledBack = (await p21.get('/api/admin/inventory/products?q=Birinchi Narx')).data.pagination.total;
+  check(rolledBack === 0 && beforeBadBatch === 1,
+    'P21.14 the valid first card was rolled back with the second',
+    JSON.stringify({ beforeBadBatch, rolledBack }));
+
+  group('P21.15 An oil carries the price fields without breaking its own rules');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'P21 Moy', type: 'oil', brand: 'NarxBrend', viscosity: '5W-30',
+    package_size: 4, cost_price: 200000, markup_amount: 40000,
+  });
+  const p21Oil = r.data && r.data.product;
+  check(r.status === 201 && p21Oil.unit === 'liter' && p21Oil.viscosity === '5W-30',
+    'P21.15 the oil is still a litre of a stated viscosity',
+    JSON.stringify(p21Oil && { unit: p21Oil.unit, viscosity: p21Oil.viscosity }));
+  check(!!p21Oil && Number(p21Oil.sale_price) === 240000,
+    'P21.15 and its sale price is 200000 + 40000', JSON.stringify(p21Oil && p21Oil.sale_price));
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'P21 Moy viskozitetsiz', type: 'oil', brand: 'NarxBrend', cost_price: 1000,
+  });
+  check(r.status === 400, 'P21.15 an oil without a viscosity is still refused',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  group('P21.16 A filter carries the same price fields');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'P21 Filtr', type: 'filter', brand: 'NarxBrend', package_size: 6,
+    cost_price: '35000.25', markup_amount: '4999.75',
+  });
+  const p21Filter = r.data && r.data.product;
+  check(r.status === 201 && p21Filter.unit === 'piece' && p21Filter.viscosity === '',
+    'P21.16 the filter is still a piece with no viscosity',
+    JSON.stringify(p21Filter && { unit: p21Filter.unit, viscosity: p21Filter.viscosity }));
+  check(!!p21Filter && Number(p21Filter.sale_price) === 40000,
+    'P21.16 35000.25 + 4999.75 is exactly 40000',
+    JSON.stringify(p21Filter && p21Filter.sale_price));
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'P21 Filtr viskozitetli', type: 'filter', brand: 'NarxBrend', viscosity: '5W-30',
+    cost_price: 1000,
+  });
+  check(r.status === 400, 'P21.16 a filter carrying a viscosity is still refused',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+
+  group('P21.17 The prices survive a restart');
+  const p21Port = PORT + 5;
+  const p21Base = `http://127.0.0.1:${p21Port}`;
+  const p21Extra = spawn(process.execPath, [ENTRY], {
+    env: serverEnv({ PORT: String(p21Port) }), stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  extraChildren.push(p21Extra);
+  const p21Ready = await (async () => {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      try { if ((await fetch(p21Base + '/api/health')).ok) return true; } catch { /* not up yet */ }
+      await new Promise((x) => setTimeout(x, 150));
+    }
+    return false;
+  })();
+  check(p21Ready, 'P21.17 a second instance boots against the same database');
+  if (p21Ready) {
+    const p21c = newClient(p21Base);
+    const li = await p21c.post('/api/auth/login', { username: 'superadmin1', password: 'password123' });
+    check(li.status === 200, 'P21.17 the second instance accepts the same credentials',
+      `status=${li.status} ${JSON.stringify(li.data)}`);
+    const rebooted = await p21c.get(`/api/admin/inventory/products/${decimal && decimal.id}`);
+    check(rebooted.status === 200 && !!rebooted.data.product,
+      'P21.17 the priced product can be read back after the restart',
+      `status=${rebooted.status} ${JSON.stringify(rebooted.data)}`);
+    check(!!rebooted.data.product && Number(rebooted.data.product.cost_price) === 185000.5
+      && Number(rebooted.data.product.markup_amount) === 9999.99
+      && Number(rebooted.data.product.sale_price) === 195000.49,
+      'P21.17 and all three numbers are byte-for-byte the ones that were stored',
+      JSON.stringify(rebooted.data.product));
+  }
+  p21Extra.kill('SIGTERM');
+
+  group('P21.18 The warehouse as a whole still adds up');
+  r = await p21.get('/api/admin/inventory/stats');
+  check(r.status === 200 && Number(r.data.stats.oilTotal) > 0 && Number(r.data.stats.filterTotal) > 0,
+    'P21.18 the dashboard totals are still populated', JSON.stringify(r.data.stats));
+  r = await p21.get('/api/admin/inventory/products?filter=low');
+  check(r.status === 200 && Array.isArray(r.data.products),
+    'P21.18 the low-stock filter still answers', `status=${r.status}`);
+  r = await p21.get('/api/admin/inventory/products?filter=out');
+  check(r.status === 200 && Array.isArray(r.data.products),
+    'P21.18 and so does the out-of-stock filter', `status=${r.status}`);
+  r = await p21.get('/api/admin/inventory/low-stock');
+  check(r.status === 200 && Array.isArray(r.data.products),
+    'P21.18 the low-stock shortcut is unchanged', `status=${r.status}`);
+  r = await p21.get('/api/admin/inventory/movements');
+  check(r.status === 200 && Array.isArray(r.data.movements) && r.data.movements.length > 0,
+    'P21.18 the movement ledger is untouched by the price columns',
+    `status=${r.status} n=${r.data.movements && r.data.movements.length}`);
+
+  // The products P17 created carry no markup, which is exactly what "not recorded"
+  // means: their sale price is their cost, and their stock still reconciles.
+  const oldRow = (await p21.get('/api/admin/inventory/products?q=Mobil')).data.products[0];
+  check(!!oldRow, 'P21.18 a product created before the markup column still exists');
+  if (oldRow) {
+    check(Number(oldRow.markup_amount) === 0,
+      'P21.18 every pre-existing product defaults its markup to 0',
+      JSON.stringify(oldRow.markup_amount));
+    check(Number(oldRow.sale_price) === Number(oldRow.cost_price),
+      'P21.18 so its sale price is unchanged by the migration',
+      JSON.stringify([oldRow.cost_price, oldRow.sale_price]));
+    const oldDetail = (await p21.get(`/api/admin/inventory/products/${oldRow.id}`)).data;
+    check(oldDetail.totals.consistent === true,
+      'P21.18 and its ledger still reconciles', JSON.stringify(oldDetail.totals));
+  }
+
+  group('P21.19 Consuming stock does not touch the prices');
+  r = await p21.post('/api/admin/inventory/products', {
+    name: 'Sarflanadigan narxli moy', type: 'oil', brand: 'NarxBrend', viscosity: '0W-40',
+    cost_price: 60000, markup_amount: 15000,
+  });
+  const jobOil = r.data && r.data.product;
+  check(r.status === 201 && !!jobOil, 'P21.19 the product to consume is created',
+    `status=${r.status} ${JSON.stringify(r.data)}`);
+  r = await p21.post(`/api/admin/inventory/products/${jobOil && jobOil.id}/stock-in`,
+    { quantity: 10, note: 'P21 kirim' });
+  check(r.status === 201 && Number(r.data.product.current_quantity) === 10,
+    'P21.19 ten litres are stocked', `status=${r.status} ${JSON.stringify(r.data && r.data.product)}`);
+  r = await p21.post('/api/admin/worklogs', {
+    master_id: masterRow.id, title: 'P21 moy sarfi', service_type: 'Moy almashtirish',
+    status: 'Tugallangan', price: 120000,
+    materials: [{ product_id: jobOil.id, quantity: 4 }],
+  });
+  check(r.status === 201, 'P21.19 a work log may consume it', `status=${r.status} ${JSON.stringify(r.data)}`);
+  const jobDetail = (await p21.get(`/api/admin/inventory/products/${jobOil && jobOil.id}`)).data;
+  check(Number(jobDetail.product.current_quantity) === 6,
+    'P21.19 six litres are left', JSON.stringify(jobDetail.product.current_quantity));
+  check(Number(jobDetail.product.cost_price) === 60000
+    && Number(jobDetail.product.markup_amount) === 15000
+    && Number(jobDetail.product.sale_price) === 75000,
+    'P21.19 and the three prices are exactly what they were before the job',
+    JSON.stringify(jobDetail.product));
+  check(jobDetail.totals.consistent === true,
+    'P21.19 the ledger still reconciles', JSON.stringify(jobDetail.totals));
+
+  r = await p21.post(`/api/admin/inventory/products/${jobOil && jobOil.id}/consume`, { quantity: 2 });
+  check(r.status === 201 && Number(r.data.product.current_quantity) === 4,
+    'P21.19 a manual consumption moves stock only', `status=${r.status} ${JSON.stringify(r.data && r.data.product)}`);
+  check(Number(r.data.product.sale_price) === 75000,
+    'P21.19 and leaves the sale price at 75000', JSON.stringify(r.data.product.sale_price));
+
+  group('P21.20 The stock export carries the three numbers');
+  r = await p21.get('/api/admin/inventory/export.csv');
+  const p21Csv = r.buf ? r.buf.toString('utf8') : '';
+  check(r.status === 200 && r.type.includes('text/csv'),
+    'P21.20 the export is still a CSV attachment', `${r.status} ${r.type}`);
+  check(p21Csv.includes('Mahsulot,Turi,Brend'), 'P21.20 the header keeps its leading columns',
+    p21Csv.slice(0, 80));
+  check(p21Csv.includes('Summa,Ustama,Sotuv narxi,Holat'),
+    'P21.20 the single Narx column has become the three real ones', p21Csv.slice(0, 160));
+  check(!p21Csv.includes('Minimal,Narx,Holat'), 'P21.20 the old single price column is gone',
+    p21Csv.slice(0, 160));
+  check(p21Csv.includes('60000,15000,75000,'),
+    'P21.20 the consumed product exports cost, markup and sale exactly as stored',
+    p21Csv.slice(Math.max(0, p21Csv.indexOf('Sarflanadigan narxli moy')), p21Csv.indexOf('Sarflanadigan narxli moy') + 160));
+  check(p21Csv.charCodeAt(0) === 0xfeff, 'P21.20 the export still carries the UTF-8 BOM Excel needs');
+  check(!/(DATABASE_URL|password|secret|Bearer\s)/i.test(p21Csv),
+    'P21.20 no secret reaches the export');
 }
 
 try {

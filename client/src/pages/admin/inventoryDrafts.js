@@ -27,15 +27,20 @@ let uidSeq = 0;
  * pieces), so it is derived when the payload is built rather than stored -- which is
  * also how the server refuses a contradicting value.
  *
- * The card deliberately has no `minimum_quantity`, `cost_price` or
- * `initial_quantity`: the operator does not collect them any more. A product is
- * created empty and stocked through "Omborga qo'shish", and the server keeps
- * applying its own defaults (minimum 0, price 0, opening stock 0) when they are
- * absent. The columns themselves stay in the database untouched.
+ * The card deliberately has no `minimum_quantity` or `initial_quantity`: the
+ * operator does not collect them any more. A product is created empty and stocked
+ * through "Omborga qo'shish", and the server keeps applying its own defaults
+ * (minimum 0, opening stock 0) when they are absent. The columns themselves stay
+ * in the database untouched.
+ *
+ * The two prices ARE collected: `cost_price` is what the shop paid and
+ * `markup_amount` is what is added on top, and the selling price the operator
+ * actually reads is their sum, which the server computes rather than stores.
  */
 export function emptyDraft() {
   return {
     name: '', type: 'oil', brand: '', viscosity: '', package_size: '',
+    cost_price: '', markup_amount: '',
   };
 }
 
@@ -130,12 +135,14 @@ export function clearFieldError(errors, index, keys) {
   return next;
 }
 
-// Same shape the server's strict parser accepts for a quantity: up to 3 decimals
-// (NUMERIC(12,3)). Matching it here means the form can say what is wrong instead of
-// waiting for a round trip to be told. The money and integer parsers went away with
-// the fields that used them -- `cost_price` and `initial_quantity` are no longer part
-// of this form, so there is nothing left to check.
+// Same shape the server's strict parsers accept. QTY_RE mirrors NUMERIC(12,3)
+// (up to 3 decimals) for a quantity; MONEY_RE mirrors NUMERIC(12,2) for a price.
+// Matching them here means the form can say what is wrong instead of waiting for a
+// round trip to be told, and it keeps the two rules from drifting apart.
 const QTY_RE = /^\d+(\.\d{1,3})?$/;
+const MONEY_RE = /^\d+(\.\d{1,2})?$/;
+// Mirrors the server's MAX_MONEY (NUMERIC(12,2) tops out at 9999999999.99).
+const MAX_MONEY = 9999999999.99;
 
 /**
  * Validates one card and returns `{ field: message }`.
@@ -145,7 +152,7 @@ const QTY_RE = /^\d+(\.\d{1,3})?$/;
  * -- the operator has to know which card to go and fix.
  *
  * An empty optional field is accepted and left out of the payload, so the server's
- * own default applies (package 1). `minimum_quantity`, `cost_price` and
+ * own default applies (package 1, price 0). `minimum_quantity` and
  * `initial_quantity` are not validated here at all: the form never collects them.
  */
 export function validateDraft(draft, index) {
@@ -171,7 +178,28 @@ export function validateDraft(draft, index) {
     }
   };
 
+  // A price is money, not a quantity: two decimals, never negative, never past
+  // the column width. `-5` is refused by the sign rather than by the format, so
+  // the message says what is actually wrong with it.
+  const checkMoney = (field, raw) => {
+    const value = String(raw == null ? '' : raw).trim();
+    if (!value) return;
+    if (value.startsWith('-')) {
+      errors[field] = `${at}: Narx manfiy bo'lishi mumkin emas.`;
+      return;
+    }
+    if (!MONEY_RE.test(value)) {
+      errors[field] = `${at}: Narx noto'g'ri formatda (masalan 45000 yoki 45000.50).`;
+      return;
+    }
+    if (Number(value) > MAX_MONEY) {
+      errors[field] = `${at}: Narx juda katta.`;
+    }
+  };
+
   check('package_size', draft.package_size, { mustBePositive: true });
+  checkMoney('cost_price', draft.cost_price);
+  checkMoney('markup_amount', draft.markup_amount);
 
   return errors;
 }
@@ -205,9 +233,12 @@ export function focusFromServerMessage(message, cardCount) {
  *
  * Only the fields the form actually shows are sent, so the server's own defaults
  * apply to the rest. That is what keeps a newly created product at
- * `current_quantity = 0` with `minimum_quantity = 0` and `cost_price = 0`: the
- * request never mentions them, and the operator stocks the product afterwards
- * through "Omborga qo'shish".
+ * `current_quantity = 0` with `minimum_quantity = 0`: the request never mentions
+ * them, and the operator stocks the product afterwards through "Omborga qo'shish".
+ *
+ * The two prices are sent as plain numeric strings ("45000"), never as a formatted
+ * string with separators or a currency suffix -- the server's parser is strict
+ * precisely so that a display convenience cannot reach the database.
  */
 export function draftPayload(draft) {
   const isOil = draft.type === 'oil';
@@ -220,5 +251,7 @@ export function draftPayload(draft) {
   };
   if (isOil) payload.viscosity = text(draft.viscosity);
   if (text(draft.package_size)) payload.package_size = text(draft.package_size);
+  if (text(draft.cost_price)) payload.cost_price = text(draft.cost_price);
+  if (text(draft.markup_amount)) payload.markup_amount = text(draft.markup_amount);
   return payload;
 }

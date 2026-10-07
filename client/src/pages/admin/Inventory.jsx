@@ -56,7 +56,10 @@ const SORTS = [
   { key: 'name', label: 'Nomi (A-Z)' },
   { key: 'newest', label: 'Eng yangi' },
   { key: 'quantity', label: 'Eng ko\'p qoldiq' },
-  { key: 'price', label: 'Eng qimmat narx' },
+  // Ordered by what the shop paid (`cost_price`, the "Summa" column): the markup
+  // is a per-product decision rather than a statement about what the stock is
+  // worth, so sorting by the sum would shuffle the list every time one is edited.
+  { key: 'price', label: 'Eng qimmat summa' },
 ];
 
 const PER_PAGE = 20;
@@ -74,8 +77,17 @@ function withUnit(n, u) {
   return `${qty(n)} ${unitLabel(u)}`;
 }
 
+/**
+ * Money in so'm, grouped: 45000 -> "45 000 so'm", 185000.5 -> "185 000,5 so'm".
+ *
+ * The locale already puts a non-breaking space between thousands and a comma
+ * before the decimals, so the decimal comma has to be kept -- rewriting it to a
+ * space (as this used to) turned 45000.5 into the unreadable "45 000 5 so'm",
+ * which the two-decimal prices on this screen reach routinely. The fraction is
+ * capped at 2 to match NUMERIC(12,2) rather than the locale default of 3.
+ */
 function money(n) {
-  return `${Number(n || 0).toLocaleString('ru-RU').replace(/,/g, ' ')} so'm`;
+  return `${Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} so'm`;
 }
 
 /** Signed delta for the movement history, e.g. "+4,5 L" / "-1 L". */
@@ -94,15 +106,20 @@ function productLabel(p) {
 
 const EMPTY_FORM = {
   name: '', type: 'oil', brand: '', viscosity: '', unit: 'liter', package_size: '',
+  cost_price: '', markup_amount: '',
 };
 
 /**
- * The edit form is deliberately the same six fields the batch form shows: type,
- * name, brand, viscosity, unit and package size. `minimum_quantity` and
- * `cost_price` still exist in the database and on the API -- the form simply does
- * not collect them any more, so a PATCH that omits them leaves the stored values
- * exactly as they were. Stock is never edited here either; it only moves through
- * "Omborga qo'shish", "Sarf" and "Tuzatish".
+ * The edit form is deliberately the same fields the batch form shows: type, name,
+ * brand, viscosity, unit, package size and the two prices. `minimum_quantity` and
+ * `initial_quantity` still exist in the database and on the API -- the form simply
+ * does not collect them any more, so a PATCH that omits them leaves the stored
+ * values exactly as they were. Stock is never edited here either; it only moves
+ * through "Omborga qo'shish", "Sarf" and "Tuzatish".
+ *
+ * The selling price is not a third field: it is `cost_price + markup_amount`, which
+ * the server computes on every read, so the form shows it as a read-only sum
+ * alongside the two values that actually produce it.
  *
  * The batch form lives in `inventoryDrafts.js` alongside its card, because the rules
  * worth testing -- what happens when a card in the middle is removed, what happens
@@ -388,7 +405,9 @@ export default function Inventory() {
                         <th className="px-4 py-3 text-right font-semibold">Qoldiq</th>
                         <th className="px-4 py-3 text-right font-semibold">Minimal</th>
                         <th className="px-4 py-3 font-semibold">Holat</th>
-                        <th className="px-4 py-3 text-right font-semibold">Narx</th>
+                        <th className="px-4 py-3 text-right font-semibold">Summa</th>
+                        <th className="px-4 py-3 text-right font-semibold">Ustama</th>
+                        <th className="px-4 py-3 text-right font-semibold">Sotuv narxi</th>
                         <th className="px-4 py-3 font-semibold">Amal</th>
                       </tr>
                     </thead>
@@ -505,7 +524,9 @@ function ProductRow({ product, onOpen, onEdit, onStock, onConsume, onAdjust }) {
       </td>
       <td className="px-4 py-3 text-right text-white/50">{withUnit(product.minimum_quantity, product.unit)}</td>
       <td className="px-4 py-3">{statusBadge(product)}</td>
-      <td className="px-4 py-3 text-right text-white/80">{money(product.cost_price)}</td>
+      <td className="px-4 py-3 text-right text-white/60">{money(product.cost_price)}</td>
+      <td className="px-4 py-3 text-right text-white/60">{money(product.markup_amount)}</td>
+      <td className="px-4 py-3 text-right font-semibold text-white/90">{money(product.sale_price)}</td>
       <td className="px-4 py-3">
         <RowActions product={product} onOpen={onOpen} onEdit={onEdit} onStock={onStock} onConsume={onConsume} onAdjust={onAdjust} />
       </td>
@@ -535,8 +556,8 @@ function ProductCard({ product, onOpen, onEdit, onStock, onConsume, onAdjust }) 
           <div className="text-xs font-semibold text-white/70">{withUnit(product.minimum_quantity, product.unit)}</div>
         </div>
         <div>
-          <div className="text-[10px] uppercase text-white/40">Narx</div>
-          <div className="text-xs font-semibold text-white/70">{money(product.cost_price)}</div>
+          <div className="text-[10px] uppercase text-white/40">Sotuv narxi</div>
+          <div className="text-xs font-semibold text-white/70">{money(product.sale_price)}</div>
         </div>
       </div>
       <div className="mt-3 flex flex-wrap gap-2 border-t border-white/5 pt-3">
@@ -840,11 +861,15 @@ function MovementRow({ m, compact }) {
  * toggle sharing one piece of state.
  *
  * Two fields that used to live here are gone from the UI but not from the table:
- * "Minimal qoldiq" and "Kelish narxi". They are left out of the payload, so the
- * server keeps the stored values and the low-stock / value reports keep working
- * exactly as before. There is no quantity field either -- stock is never edited
- * directly, only moved through the stock endpoints, so a control that the server
- * would reject is not offered.
+ * "Minimal qoldiq" and the opening stock. They are left out of the payload, so the
+ * server keeps the stored values and the low-stock report keeps working exactly as
+ * before. There is no quantity field either -- stock is never edited directly, only
+ * moved through the stock endpoints, so a control that the server would reject is
+ * not offered.
+ *
+ * The two prices are back on the form: what the shop paid (`cost_price`) and what
+ * is added on top (`markup_amount`). The selling price is their sum, so it is shown
+ * rather than edited.
  */
 function EditProductModal({ open, product, onClose, onSaved }) {
   const [form, setForm] = useState(EMPTY_FORM);
@@ -863,6 +888,8 @@ function EditProductModal({ open, product, onClose, onSaved }) {
             viscosity: product.viscosity || '',
             unit: product.unit,
             package_size: String(product.package_size ?? ''),
+            cost_price: String(product.cost_price ?? ''),
+            markup_amount: String(product.markup_amount ?? ''),
           }
         : EMPTY_FORM
     );
@@ -884,6 +911,11 @@ function EditProductModal({ open, product, onClose, onSaved }) {
         brand: form.brand,
         unit: isOil ? 'liter' : 'piece',
         package_size: form.package_size,
+        // Sent as typed, never as a formatted string: the server's parser accepts
+        // "45000" and "45000.50" and refuses anything a thousands separator could
+        // have smuggled in.
+        cost_price: String(form.cost_price ?? '').trim(),
+        markup_amount: String(form.markup_amount ?? '').trim(),
       };
       if (isOil) payload.viscosity = form.viscosity;
       await api.patch(`/admin/inventory/products/${product.id}`, payload);
@@ -931,6 +963,39 @@ function EditProductModal({ open, product, onClose, onSaved }) {
             <label className="label">Qadoq hajmi ({isOil ? 'L' : 'dona'})</label>
             <input className="field" inputMode="decimal" value={form.package_size} onChange={set('package_size')} placeholder={isOil ? '4' : '1'} />
           </div>
+          <div>
+            <label className="label">Summa (so'm)</label>
+            <input
+              className="field"
+              type="number"
+              min="0"
+              step="0.01"
+              inputMode="decimal"
+              value={form.cost_price}
+              onChange={set('cost_price')}
+              placeholder="45000"
+            />
+            <p className="mt-1 text-xs text-white/35">Do'konning xarid narxi.</p>
+          </div>
+          <div>
+            <label className="label">Ustama summa (so'm)</label>
+            <input
+              className="field"
+              type="number"
+              min="0"
+              step="0.01"
+              inputMode="decimal"
+              value={form.markup_amount}
+              onChange={set('markup_amount')}
+              placeholder="10000"
+            />
+            <p className="mt-1 text-xs text-white/35">
+              Sotuv narxi:{' '}
+              <span className="font-semibold text-white/70">
+                {money(Number(form.cost_price || 0) + Number(form.markup_amount || 0))}
+              </span>
+            </p>
+          </div>
         </div>
 
         <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
@@ -970,15 +1035,17 @@ function EditProductModal({ open, product, onClose, onSaved }) {
 /**
  * One product card in the batch form.
  *
- * Six fields, in the order the operator reads them: what it is, what it is called,
- * who makes it, how thick it is (oil only), how it is counted and how big one pack
- * is. Viscosity exists only for oil, and the unit is a disabled readout rather than
- * a choice because it is derived from the type on the server too. The grid is one
- * column on a phone and two on a desktop, which is what the `sm:grid-cols-2` does.
+ * Eight fields, in the order the operator reads them: what it is, what it is called,
+ * who makes it, how thick it is (oil only), how it is counted, how big one pack is,
+ * what it cost and what is added on top. Viscosity exists only for oil, and the unit
+ * is a disabled readout rather than a choice because it is derived from the type on
+ * the server too. The grid is one column on a phone and two on a desktop, which is
+ * what the `sm:grid-cols-2` does.
  *
- * Minimal quantity, cost price and opening stock are absent on purpose -- the card
- * stays short, the product is created empty, and it is stocked afterwards through
- * "Omborga qo'shish".
+ * Minimal quantity and opening stock are absent on purpose -- the card stays short,
+ * the product is created empty, and it is stocked afterwards through "Omborga
+ * qo'shish". The selling price is not a field either: it is the sum of the last two,
+ * which the card previews instead of asking the operator to add it up.
  */
 function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputRef, highlighted }) {
   const isOil = draft.type === 'oil';
@@ -1070,6 +1137,42 @@ function DraftCard({ index, draft, errors, removable, onChange, onRemove, inputR
             placeholder={isOil ? '4' : '1'}
           />
           {hint('package_size')}
+        </div>
+        <div>
+          <label className="label">Summa (so'm)</label>
+          <input
+            className={`field ${ring('cost_price')}`}
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={draft.cost_price}
+            onChange={field('cost_price')}
+            placeholder="45000"
+          />
+          {hint('cost_price')}
+        </div>
+        <div>
+          <label className="label">Ustama summa (so'm)</label>
+          <input
+            className={`field ${ring('markup_amount')}`}
+            type="number"
+            min="0"
+            step="0.01"
+            inputMode="decimal"
+            value={draft.markup_amount}
+            onChange={field('markup_amount')}
+            placeholder="10000"
+          />
+          {hint('markup_amount')}
+          {Object.keys(errors).length === 0 && String(draft.cost_price || '').trim() !== '' && (
+            <p className="mt-1 text-xs text-white/35">
+              Sotuv narxi:{' '}
+              <span className="font-semibold text-white/70">
+                {money(Number(draft.cost_price || 0) + Number(draft.markup_amount || 0))}
+              </span>
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -1529,7 +1632,9 @@ function ProductDetailModal({ product, onClose }) {
             <SummaryTile label="Jami sarf" value={withUnit(data.totals.consumed, data.product.unit)} tone="text-red-300" />
             <SummaryTile label="Tuzatishlar" value={signed(data.totals.adjusted, data.product.unit)} tone="text-amber-300" />
             <SummaryTile label="Minimal" value={withUnit(data.product.minimum_quantity, data.product.unit)} tone="text-white/70" />
-            <SummaryTile label="Narx" value={money(data.product.cost_price)} tone="text-white/70" />
+            <SummaryTile label="Summa (tannarx)" value={money(data.product.cost_price)} tone="text-white/70" />
+            <SummaryTile label="Ustama" value={money(data.product.markup_amount)} tone="text-white/70" />
+            <SummaryTile label="Sotuv narxi" value={money(data.product.sale_price)} tone="text-white" />
           </div>
 
           {data.totals.consistent ? (

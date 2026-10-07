@@ -220,7 +220,8 @@ router.get('/export.csv', async (req, res) => {
   inv.csvResponse(
     res,
     `ombor-${inv.appNow()}.csv`,
-    ['Mahsulot', 'Turi', 'Brend', 'Viskozitet', 'Birlik', 'Qadoq', 'Qoldiq', 'Minimal', 'Narx', 'Holat'],
+    ['Mahsulot', 'Turi', 'Brend', 'Viskozitet', 'Birlik', 'Qadoq', 'Qoldiq', 'Minimal',
+      'Summa', 'Ustama', 'Sotuv narxi', 'Holat'],
     rows.map((p) => [
       p.name,
       p.type === 'oil' ? 'Moy' : 'Filtr',
@@ -231,6 +232,8 @@ router.get('/export.csv', async (req, res) => {
       Number(p.current_quantity),
       Number(p.minimum_quantity),
       Number(p.cost_price),
+      Number(p.markup_amount),
+      Number(p.sale_price),
       Number(p.is_active) ? STATE_UZ[stockState(p)] : 'Arxiv',
     ])
   );
@@ -507,6 +510,7 @@ router.patch('/products/:id', async (req, res) => {
     package_size: body.package_size !== undefined ? body.package_size : existing.package_size,
     minimum_quantity: body.minimum_quantity !== undefined ? body.minimum_quantity : existing.minimum_quantity,
     cost_price: body.cost_price !== undefined ? body.cost_price : existing.cost_price,
+    markup_amount: body.markup_amount !== undefined ? body.markup_amount : existing.markup_amount,
   });
 
   const isActive =
@@ -532,7 +536,8 @@ router.patch('/products/:id', async (req, res) => {
       .prepare(
         `UPDATE inventory_products
             SET name = ?, type = ?, brand = ?, viscosity = ?, unit = ?, package_size = ?,
-                minimum_quantity = ?, cost_price = ?, is_active = ?, updated_at = app_now()
+                minimum_quantity = ?, cost_price = ?, markup_amount = ?, is_active = ?,
+                updated_at = app_now()
           WHERE id = ?
         RETURNING ${inv.PRODUCT_FIELDS}`
       )
@@ -545,6 +550,7 @@ router.patch('/products/:id', async (req, res) => {
         clean.package_size,
         clean.minimum_quantity,
         clean.cost_price,
+        clean.markup_amount,
         isActive,
         id
       );
